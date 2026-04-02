@@ -41,6 +41,9 @@ export default {
       return withCors(json({ error: safeErrorMessage(err) }, 500), request, env);
     }
   },
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(cleanExpiredTranslationCacheByCron(env));
+  },
 };
 
 async function serveWebUI(request, env) {
@@ -72,6 +75,12 @@ async function handleTranslateCompat(request, env, ctx) {
     if (cached?.body != null) {
       const hitResponse = new Response(cached.body, { status: 200, headers: cached.headers });
       return withCors(withCacheStatus(hitResponse, "HIT"), request, env);
+    }
+    const dbCached = await getDbCachedTranslationResponse(cacheKey, env);
+    if (dbCached?.body != null) {
+      const l2HitResponse = new Response(dbCached.body, { status: 200, headers: dbCached.headers });
+      ctx.waitUntil(putCloudflareCacheOnly(cacheKey, dbCached.body, dbCached.headers, env));
+      return withCors(withCacheStatus(l2HitResponse, "HIT-DB"), request, env);
     }
   }
 
@@ -404,6 +413,10 @@ async function ensureSchema(env) {
     .prepare("CREATE TABLE IF NOT EXISTS deepl_keys (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,auth_key TEXT NOT NULL,endpoint TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',disable_type TEXT,disabled_until INTEGER,last_error_code TEXT,last_error_message TEXT,last_used_at INTEGER,last_checked_at INTEGER,character_count INTEGER,character_limit INTEGER,created_at INTEGER,updated_at INTEGER)")
     .run();
   await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_deepl_keys_status_id ON deepl_keys(status, id)").run();
+  await env.DB
+    .prepare("CREATE TABLE IF NOT EXISTS deepl_translation_cache (cache_key TEXT PRIMARY KEY, body TEXT NOT NULL, headers_json TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)")
+    .run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_translation_cache_expires_at ON deepl_translation_cache(expires_at)").run();
 }
 
 function detectProviderByEndpoint(endpoint) {
@@ -566,21 +579,89 @@ async function getCachedTranslationResponse(request, cacheKey, env) {
   const matched = await cache.match(cacheRequest);
   if (!matched) return null;
   const body = await matched.text();
-  const headers = new Headers(matched.headers);
+  const headers = sanitizeCacheableHeaders(new Headers(matched.headers));
   return { body, headers };
 }
 
 async function putCachedTranslationResponse(cacheKey, response, env) {
+  const body = await response.text();
+  const headers = sanitizeCacheableHeaders(new Headers(response.headers));
+  await Promise.all([putCloudflareCacheOnly(cacheKey, body, headers, env), putDbCacheOnly(cacheKey, body, headers, env)]);
+}
+
+async function putCloudflareCacheOnly(cacheKey, body, headers, env) {
+  const nextHeaders = new Headers(headers);
   const ttl = getCacheTTLSeconds(env);
   const cache = caches.default;
   const cacheUrl = `https://cache.local/__cache/${cacheKey}`;
-  const body = await response.text();
-  const headers = new Headers(response.headers);
-  headers.set("Content-Type", headers.get("Content-Type") || "application/json; charset=utf-8");
-  headers.set("Cache-Control", `public, max-age=${ttl}`);
-  headers.set("X-Cache-Stored", "1");
-  const cacheResponse = new Response(body, { status: 200, headers });
+  nextHeaders.set("Content-Type", nextHeaders.get("Content-Type") || "application/json; charset=utf-8");
+  nextHeaders.set("Cache-Control", `public, max-age=${ttl}`);
+  nextHeaders.set("X-Cache-Stored", "1");
+  const cacheResponse = new Response(body, { status: 200, headers: nextHeaders });
   await cache.put(cacheUrl, cacheResponse);
+}
+
+async function getDbCachedTranslationResponse(cacheKey, env) {
+  const now = Date.now();
+  const row = await env.DB
+    .prepare("SELECT body, headers_json FROM deepl_translation_cache WHERE cache_key = ? AND expires_at > ?")
+    .bind(cacheKey, now)
+    .first();
+  if (!row) return null;
+  let headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+  try {
+    const parsed = JSON.parse(String(row.headers_json || "{}"));
+    if (parsed && typeof parsed === "object") {
+      headers = sanitizeCacheableHeaders(new Headers(parsed));
+    }
+  } catch {}
+  return { body: String(row.body || ""), headers };
+}
+
+async function putDbCacheOnly(cacheKey, body, headers, env) {
+  const ttl = getCacheTTLSeconds(env);
+  const now = Date.now();
+  const expiresAt = now + ttl * 1000;
+  const headersJson = JSON.stringify(Object.fromEntries(headers.entries()));
+  await env.DB
+    .prepare("INSERT OR REPLACE INTO deepl_translation_cache (cache_key, body, headers_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(cacheKey, body, headersJson, now, expiresAt)
+    .run();
+}
+
+function sanitizeCacheableHeaders(headers) {
+  const next = new Headers(headers);
+  next.delete("X-Upstream-Key-Name");
+  next.delete("x-upstream-key-name");
+  return next;
+}
+
+async function cleanExpiredTranslationCacheByCron(env) {
+  if (!env.DB || typeof env.DB.prepare !== "function") return;
+  await ensureSchema(env);
+  const now = Date.now();
+  const batchSize = getCleanupBatchSize(env);
+  const maxRounds = getCleanupMaxRounds(env);
+  for (let i = 0; i < maxRounds; i += 1) {
+    const result = await env.DB
+      .prepare("DELETE FROM deepl_translation_cache WHERE cache_key IN (SELECT cache_key FROM deepl_translation_cache WHERE expires_at <= ? LIMIT ?)")
+      .bind(now, batchSize)
+      .run();
+    const changed = Number(result?.meta?.changes || 0);
+    if (changed < batchSize) break;
+  }
+}
+
+function getCleanupBatchSize(env) {
+  const raw = Number(env.CACHE_CLEANUP_BATCH_SIZE || 500);
+  if (!Number.isFinite(raw) || raw <= 0) return 500;
+  return Math.floor(raw);
+}
+
+function getCleanupMaxRounds(env) {
+  const raw = Number(env.CACHE_CLEANUP_MAX_ROUNDS || 20);
+  if (!Number.isFinite(raw) || raw <= 0) return 20;
+  return Math.floor(raw);
 }
 
 function normalizeFormParamsForCache(params) {
