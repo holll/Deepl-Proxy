@@ -42,7 +42,7 @@ CREATE TABLE deepl_keys (
 ```
 是**直接兼容**的。当前版本不再使用 `site_type` 字段，而是由 `endpoint` 自动推断 provider（`api.deepl.com` 视为 official，其它按 deepl-pro 处理）。
 
-如果你历史库中存在旧的 `site_type` 字段，代码会尝试自动删除（支持时生效，不支持则忽略，不影响运行）。
+注意：当前版本已移除针对历史表结构的自动 `ALTER TABLE` 兼容逻辑，建议按上面的结构初始化数据库后再部署。
 
 ### 前后端分离结构
 - 后端 Worker：`src/index.js`
