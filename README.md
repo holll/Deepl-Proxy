@@ -41,6 +41,7 @@
   - `HIT-DB`：命中 D1 二级缓存；
   - `MISS`：两级未命中，已请求上游并写回缓存。
 - 缓存数据不会保存 `X-Upstream-Key-Name`，避免缓存暴露上游 key 标识。
+- 过期缓存清理由 **Cron Trigger** 执行（不在查询路径中做清理），降低实时请求时延。
 
 ---
 
@@ -79,6 +80,12 @@ wrangler login
 - Worker 基本信息（`name`、`main` 等）；
 - D1 绑定 `DB`（`[[d1_databases]]`）；
 - 如使用 Dashboard 变量，建议保留 `keep_vars = true`。
+- 如需自动清理过期 D1 缓存，配置 Cron 触发器（示例）：
+
+```toml
+[triggers]
+crons = ["*/10 * * * *"]
+```
 
 > 重要：`DB` 绑定名必须与代码一致（`env.DB`）。
 
@@ -127,6 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_translation_cache_expires_at ON deepl_translation
 - `ADMIN_COOKIE_SECRET`：管理员会话签名密钥；
 - `ALLOW_ORIGIN`：允许跨域来源（可选）；
 - `CACHE_TTL_SECONDS`：缓存秒数（默认 86400）。
+- `CACHE_CLEANUP_BATCH_SIZE`：每轮 Cron 清理条数（默认 500）。
+- `CACHE_CLEANUP_MAX_ROUNDS`：单次 Cron 最多清理轮数（默认 20）。
 
 可用命令示例：
 ```bash

@@ -41,6 +41,9 @@ export default {
       return withCors(json({ error: safeErrorMessage(err) }, 500), request, env);
     }
   },
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(cleanExpiredTranslationCacheByCron(env));
+  },
 };
 
 async function serveWebUI(request, env) {
@@ -604,10 +607,7 @@ async function getDbCachedTranslationResponse(cacheKey, env) {
     .prepare("SELECT body, headers_json FROM deepl_translation_cache WHERE cache_key = ? AND expires_at > ?")
     .bind(cacheKey, now)
     .first();
-  if (!row) {
-    await env.DB.prepare("DELETE FROM deepl_translation_cache WHERE cache_key = ? AND expires_at <= ?").bind(cacheKey, now).run();
-    return null;
-  }
+  if (!row) return null;
   let headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
   try {
     const parsed = JSON.parse(String(row.headers_json || "{}"));
@@ -634,6 +634,34 @@ function sanitizeCacheableHeaders(headers) {
   next.delete("X-Upstream-Key-Name");
   next.delete("x-upstream-key-name");
   return next;
+}
+
+async function cleanExpiredTranslationCacheByCron(env) {
+  if (!env.DB || typeof env.DB.prepare !== "function") return;
+  await ensureSchema(env);
+  const now = Date.now();
+  const batchSize = getCleanupBatchSize(env);
+  const maxRounds = getCleanupMaxRounds(env);
+  for (let i = 0; i < maxRounds; i += 1) {
+    const result = await env.DB
+      .prepare("DELETE FROM deepl_translation_cache WHERE cache_key IN (SELECT cache_key FROM deepl_translation_cache WHERE expires_at <= ? LIMIT ?)")
+      .bind(now, batchSize)
+      .run();
+    const changed = Number(result?.meta?.changes || 0);
+    if (changed < batchSize) break;
+  }
+}
+
+function getCleanupBatchSize(env) {
+  const raw = Number(env.CACHE_CLEANUP_BATCH_SIZE || 500);
+  if (!Number.isFinite(raw) || raw <= 0) return 500;
+  return Math.floor(raw);
+}
+
+function getCleanupMaxRounds(env) {
+  const raw = Number(env.CACHE_CLEANUP_MAX_ROUNDS || 20);
+  if (!Number.isFinite(raw) || raw <= 0) return 20;
+  return Math.floor(raw);
 }
 
 function normalizeFormParamsForCache(params) {
