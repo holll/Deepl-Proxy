@@ -13,8 +13,7 @@ ALLOW_ORIGIN = "*"
 # 请替换为你自己的 database_id。
 [[d1_databases]]
 binding = "DB"
-database_name = "deepl-proxy-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_name = "deepl-gateway-db"
 
 [assets]
 directory = "./webui"
