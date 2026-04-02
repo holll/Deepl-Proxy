@@ -13,12 +13,16 @@ export default {
         return serveWebUI(request, env);
       }
 
-      await ensureSchema(env);
-
       // Admin auth/session
       if (url.pathname === "/admin/login" && request.method === "POST") return handleAdminLogin(request, env);
       if (url.pathname === "/admin/logout" && request.method === "POST") return handleAdminLogout(request, env);
       if (url.pathname === "/admin/session" && request.method === "GET") return handleAdminSession(request, env);
+
+      // 以下路由依赖 D1
+      if (!env.DB || typeof env.DB.prepare !== "function") {
+        return withCors(json({ error: "DB binding is not configured. Please bind D1 as env.DB." }, 500), request, env);
+      }
+      await ensureSchema(env);
 
       // Admin key CRUD
       if (url.pathname === "/admin/keys" && request.method === "GET") return handleAdminKeys(request, env);
