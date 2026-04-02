@@ -44,17 +44,52 @@ CREATE TABLE deepl_keys (
 
 注意：当前版本已移除针对历史表结构的自动 `ALTER TABLE` 兼容逻辑，建议按上面的结构初始化数据库后再部署。
 
+### 手动建表 SQL（D1）
+如果你希望手动初始化数据库，可执行：
+```sql
+CREATE TABLE IF NOT EXISTS deepl_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  auth_key TEXT NOT NULL,
+  endpoint TEXT NOT NULL DEFAULT 'https://api.deepl-pro.com',
+  status TEXT NOT NULL DEFAULT 'active',
+  disable_type TEXT,
+  disabled_until INTEGER,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  last_used_at INTEGER,
+  last_checked_at INTEGER,
+  character_count INTEGER,
+  character_limit INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deepl_keys_status_id ON deepl_keys(status, id);
+
+CREATE TABLE IF NOT EXISTS deepl_translation_cache (
+  cache_key TEXT PRIMARY KEY,
+  body TEXT NOT NULL,
+  headers_json TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_translation_cache_expires_at ON deepl_translation_cache(expires_at);
+```
+
 ### 前后端分离结构
 - 后端 Worker：`src/index.js`
 - 管理台静态资源：`webui/index.html`, `webui/app.js`, `webui/style.css`
 
-### 翻译结果缓存（Cloudflare Cache）
+### 翻译结果缓存（两级缓存：Cloudflare Cache + D1）
 - 变量 `CACHE_TTL_SECONDS` 用于控制翻译结果缓存秒数（`>0` 开启，`<=0` 关闭）。
 - 命中条件：相同的翻译请求参数（`text`、`target_lang` 等）会命中同一个缓存键。
-- 命中后会直接返回缓存结果，不再请求上游 DeepL API。
+- 一级缓存：先查 Cloudflare Cache；命中后直接返回，不再请求上游 DeepL API。
+- 二级缓存：若 Cloudflare Cache 未命中，则查询 D1 表 `deepl_translation_cache`；命中后会回填 Cloudflare Cache 并返回。
 - 响应头 `X-Cache-Status`：
   - `HIT`：命中缓存；
-  - `MISS`：未命中，已请求上游并回填缓存。
+  - `HIT-DB`：一级未命中，命中二级 D1 缓存；
+  - `MISS`：两级都未命中，已请求上游并回填缓存。
+- 缓存字段中不保存 `X-Upstream-Key-Name`（避免缓存泄露上游 key 名称）。
 - 如需临时跳过缓存，可在请求头加 `x-no-cache: 1`。
 
 ### 部署方式
