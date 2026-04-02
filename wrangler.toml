@@ -1,0 +1,10 @@
+name = "deepl-proxy"
+main = "src/index.js"
+compatibility_date = "2026-04-02"
+
+[vars]
+ALLOW_ORIGIN = "*"
+
+[assets]
+directory = "./webui"
+binding = "ASSETS"
