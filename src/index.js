@@ -64,14 +64,14 @@ async function handleTranslateCompat(request, env, ctx) {
 
   const clientReq = await parseIncomingTranslateRequest(request);
   if (!clientReq.ok) return withCors(json({ message: clientReq.error }, clientReq.status || 400), request, env);
-  const cacheTTL = getCacheTTLSeconds(env);
-  const shouldBypassCache = isNoCacheRequest(request);
-  const cacheKey = !shouldBypassCache && cacheTTL > 0 ? await buildTranslateCacheKey(request, clientReq.form) : null;
+  const shouldSkipCache = shouldBypassCache(request);
+  const cacheKey = !shouldSkipCache ? await buildTranslationCacheKey(clientReq) : null;
 
   if (cacheKey) {
-    const cached = await caches.default.match(cacheKey);
-    if (cached) {
-      return withCors(withCacheStatus(cached, "HIT"), request, env);
+    const cached = await getCachedTranslationResponse(request, cacheKey, env);
+    if (cached?.body != null) {
+      const hitResponse = new Response(cached.body, { status: 200, headers: cached.headers });
+      return withCors(withCacheStatus(hitResponse, "HIT"), request, env);
     }
   }
 
@@ -101,14 +101,7 @@ async function handleTranslateCompat(request, env, ctx) {
           },
         });
         if (resp.ok && cacheKey) {
-          const cacheable = new Response(text, {
-            status: resp.status,
-            headers: {
-              "Content-Type": passthrough.headers.get("Content-Type") || "application/json; charset=utf-8",
-              "Cache-Control": `public, max-age=${cacheTTL}`,
-            },
-          });
-          ctx.waitUntil(caches.default.put(cacheKey, cacheable));
+          ctx.waitUntil(putCachedTranslationResponse(cacheKey, passthrough.clone(), env));
           if (shouldSampleUsageRefresh(env)) {
             ctx.waitUntil(refreshUsageSnapshotSafely(env, key));
           }
@@ -292,7 +285,7 @@ async function parseIncomingTranslateRequest(request) {
     const texts = Array.isArray(body.text) ? body.text : [body.text];
     for (const text of texts) form.append("text", text);
     form.append("target_lang", String(body.target_lang).toUpperCase());
-    return { ok: true, form };
+    return { ok: true, form, cacheIdentity: normalizeJsonBodyForCache(body) };
   }
 
   const raw = await request.text();
@@ -300,7 +293,7 @@ async function parseIncomingTranslateRequest(request) {
   if (!form.getAll("text").length || !form.get("target_lang")) {
     return { ok: false, status: 400, error: "text and target_lang are required" };
   }
-  return { ok: true, form };
+  return { ok: true, form, cacheIdentity: normalizeFormParamsForCache(form) };
 }
 
 function classifyDeepLError(status, text, siteType) {
@@ -532,23 +525,92 @@ function numberOrNull(v) {
 }
 
 function getCacheTTLSeconds(env) {
-  const raw = Number(env.CACHE_TTL_SECONDS ?? 0);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  const raw = Number(env.CACHE_TTL_SECONDS || 86400);
+  if (!Number.isFinite(raw) || raw <= 0) return 86400;
+  return Math.floor(raw);
 }
 
-function isNoCacheRequest(request) {
-  return request.headers.get("x-no-cache") === "1";
+function shouldBypassCache(request) {
+  const header = request.headers.get("x-no-cache");
+  return header === "1" || header === "true";
 }
 
-async function buildTranslateCacheKey(request, form) {
-  const hash = await sha256Hex(form.toString());
-  const url = new URL(request.url);
-  return new Request(`${url.origin}/__cache/translate?hash=${hash}`, { method: "GET" });
+async function buildTranslationCacheKey(clientReq) {
+  const payload = JSON.stringify(clientReq.cacheIdentity || {});
+  const digest = await sha256Hex(payload);
+  return `deepl:translate:${digest}`;
 }
 
 async function sha256Hex(input) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(input || "")));
   return bytesToHex(new Uint8Array(digest));
+}
+
+async function getCachedTranslationResponse(request, cacheKey, env) {
+  const cache = caches.default;
+  const cacheUrl = `https://cache.local/__cache/${cacheKey}`;
+  const cacheRequest = new Request(cacheUrl, { method: "GET" });
+  const matched = await cache.match(cacheRequest);
+  if (!matched) return null;
+  const body = await matched.text();
+  const headers = new Headers(matched.headers);
+  return { body, headers };
+}
+
+async function putCachedTranslationResponse(cacheKey, response, env) {
+  const ttl = getCacheTTLSeconds(env);
+  const cache = caches.default;
+  const cacheUrl = `https://cache.local/__cache/${cacheKey}`;
+  const body = await response.text();
+  const headers = new Headers(response.headers);
+  headers.set("Content-Type", headers.get("Content-Type") || "application/json; charset=utf-8");
+  headers.set("Cache-Control", `public, max-age=${ttl}`);
+  headers.set("X-Cache-Stored", "1");
+  const cacheResponse = new Response(body, { status: 200, headers });
+  await cache.put(cacheUrl, cacheResponse);
+}
+
+function normalizeFormParamsForCache(params) {
+  return {
+    text: params.getAll("text"),
+    target_lang: upperOrNull(params.get("target_lang")),
+    source_lang: upperOrNull(params.get("source_lang")),
+    formality: params.get("formality"),
+    glossary_id: params.get("glossary_id"),
+    context: params.get("context"),
+    model_type: params.get("model_type"),
+    split_sentences: params.get("split_sentences"),
+    preserve_formatting: params.get("preserve_formatting"),
+    tag_handling: params.get("tag_handling"),
+    outline_detection: params.get("outline_detection"),
+    non_splitting_tags: params.getAll("non_splitting_tags"),
+    splitting_tags: params.getAll("splitting_tags"),
+    ignore_tags: params.getAll("ignore_tags"),
+  };
+}
+
+function normalizeJsonBodyForCache(body) {
+  return {
+    text: Array.isArray(body.text) ? body.text : [body.text],
+    target_lang: upperOrNull(body.target_lang),
+    source_lang: upperOrNull(body.source_lang),
+    formality: body.formality ?? null,
+    glossary_id: body.glossary_id ?? null,
+    context: body.context ?? null,
+    model_type: body.model_type ?? null,
+    split_sentences: body.split_sentences ?? null,
+    preserve_formatting: body.preserve_formatting ?? null,
+    tag_handling: body.tag_handling ?? null,
+    outline_detection: body.outline_detection ?? null,
+    non_splitting_tags: Array.isArray(body.non_splitting_tags) ? body.non_splitting_tags : [],
+    splitting_tags: Array.isArray(body.splitting_tags) ? body.splitting_tags : [],
+    ignore_tags: Array.isArray(body.ignore_tags) ? body.ignore_tags : [],
+  };
+}
+
+function upperOrNull(value) {
+  if (value == null) return null;
+  return String(value).toUpperCase();
 }
 
 function withCacheStatus(response, status) {
