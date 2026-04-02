@@ -1,5 +1,5 @@
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
@@ -13,21 +13,26 @@ export default {
         return serveWebUI(request, env);
       }
 
-      await ensureSchema(env);
-
       // Admin auth/session
       if (url.pathname === "/admin/login" && request.method === "POST") return handleAdminLogin(request, env);
       if (url.pathname === "/admin/logout" && request.method === "POST") return handleAdminLogout(request, env);
       if (url.pathname === "/admin/session" && request.method === "GET") return handleAdminSession(request, env);
+
+      // 以下路由依赖 D1
+      if (!env.DB || typeof env.DB.prepare !== "function") {
+        return withCors(json({ error: "DB binding is not configured. Please bind D1 as env.DB." }, 500), request, env);
+      }
+      await ensureSchema(env);
 
       // Admin key CRUD
       if (url.pathname === "/admin/keys" && request.method === "GET") return handleAdminKeys(request, env);
       if (url.pathname === "/admin/keys" && request.method === "POST") return handleAdminKeyCreate(request, env);
       if (url.pathname.startsWith("/admin/keys/") && request.method === "PUT") return handleAdminKeyUpdate(request, env, url.pathname.split("/").pop());
       if (url.pathname.startsWith("/admin/keys/") && request.method === "DELETE") return handleAdminKeyDelete(request, env, url.pathname.split("/").pop());
+      if (url.pathname === "/admin/usage-refresh" && (request.method === "POST" || request.method === "GET")) return handleUsageRefresh(request, env);
 
       // DeepL compatible API
-      if ((url.pathname === "/v2/translate" || url.pathname === "/translate") && request.method === "POST") return handleTranslateCompat(request, env);
+      if ((url.pathname === "/v2/translate" || url.pathname === "/translate") && request.method === "POST") return handleTranslateCompat(request, env, ctx);
       if (url.pathname === "/v2/usage" && request.method === "GET") return handleUsageCompat(request, env);
 
       if (url.pathname === "/health") return withCors(json({ ok: true, now: new Date().toISOString() }), request, env);
@@ -53,7 +58,7 @@ async function serveWebUI(request, env) {
   return withCors(response, request, env);
 }
 
-async function handleTranslateCompat(request, env) {
+async function handleTranslateCompat(request, env, ctx) {
   const authError = verifyGatewayAuthCompat(request, env);
   if (authError) return withCors(authError, request, env);
 
@@ -85,6 +90,9 @@ async function handleTranslateCompat(request, env) {
             "X-Key-Site-Type": key.site_type || "deepl_pro",
           },
         });
+        if (resp.ok && shouldSampleUsageRefresh(env)) {
+          ctx.waitUntil(refreshUsageSnapshotSafely(env, key));
+        }
         return withCors(passthrough, request, env);
       }
 
@@ -122,8 +130,16 @@ async function handleUsageCompat(request, env) {
 async function handleAdminKeys(request, env) {
   const authError = await verifyAdminAuth(request, env);
   if (authError) return withCors(authError, request, env);
-  const rs = await env.DB.prepare("SELECT id,name,endpoint,site_type,status,disable_type,character_count,character_limit,created_at,updated_at FROM deepl_keys ORDER BY id ASC").all();
-  return withCors(json({ keys: rs.results || [] }), request, env);
+  const rs = await env.DB.prepare("SELECT id,name,endpoint,site_type,status,disable_type,disabled_until,last_error_code,last_error_message,last_used_at,last_checked_at,character_count,character_limit,created_at,updated_at FROM deepl_keys ORDER BY id ASC").all();
+  const keys = (rs.results || []).map((row) => ({
+    ...row,
+    disabled_until_iso: row.disabled_until ? new Date(row.disabled_until).toISOString() : null,
+    last_used_at_iso: row.last_used_at ? new Date(row.last_used_at).toISOString() : null,
+    last_checked_at_iso: row.last_checked_at ? new Date(row.last_checked_at).toISOString() : null,
+    created_at_iso: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updated_at_iso: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  }));
+  return withCors(json({ keys }), request, env);
 }
 
 async function handleAdminKeyCreate(request, env) {
@@ -178,6 +194,31 @@ async function handleAdminKeyDelete(request, env, id) {
   return withCors(json({ ok: true }), request, env);
 }
 
+async function handleUsageRefresh(request, env) {
+  const authError = await verifyAdminAuth(request, env);
+  if (authError) return withCors(authError, request, env);
+  const keys = await getActiveKeys(env);
+  const results = [];
+  for (const key of keys) {
+    try {
+      if ((key.site_type || "deepl_pro") === "official") {
+        results.push({ key: key.name, ok: false, skipped: "official_usage_not_supported" });
+        continue;
+      }
+      const usage = await fetchUsage(key);
+      if (usage.ok && usage.data) {
+        await updateUsageSnapshot(env, key.id, usage.data);
+        results.push({ key: key.name, ok: true, data: usage.data });
+      } else {
+        results.push({ key: key.name, ok: false, status: usage.status, body: truncate(usage.text, 200) });
+      }
+    } catch (err) {
+      results.push({ key: key.name, ok: false, error: safeErrorMessage(err) });
+    }
+  }
+  return withCors(json({ results }), request, env);
+}
+
 function verifyGatewayAuthCompat(request, env) {
   if (!env.GATEWAY_TOKEN) return json({ message: "GATEWAY_TOKEN is not configured" }, 500);
   const auth = request.headers.get("Authorization") || "";
@@ -188,22 +229,35 @@ function verifyGatewayAuthCompat(request, env) {
 
 async function verifyAdminAuth(request, env) {
   if (!env.ADMIN_TOKEN) return json({ error: "ADMIN_TOKEN is not configured" }, 500);
-  const auth = request.headers.get("Authorization") || "";
-  return auth === `Bearer ${env.ADMIN_TOKEN}` ? null : json({ error: "Unauthorized" }, 401);
+  const ok = await isAdminAuthorized(request, env);
+  return ok ? null : json({ error: "Unauthorized" }, 401);
 }
 
 async function handleAdminLogin(request, env) {
   const body = await request.json().catch(() => ({}));
-  if (body.admin_token !== env.ADMIN_TOKEN) return withCors(json({ error: "Unauthorized" }, 401), request, env);
-  return withCors(json({ ok: true, authenticated: true }, 200), request, env);
+  if (String(body?.admin_token || "") !== String(env.ADMIN_TOKEN || "")) {
+    return withCors(json({ error: "Unauthorized" }, 401), request, env);
+  }
+  const headers = new Headers({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  headers.append("Set-Cookie", await createAdminSessionCookie(env));
+  return withCors(new Response(JSON.stringify({ ok: true, authenticated: true }), { status: 200, headers }), request, env);
 }
 
 async function handleAdminLogout(request, env) {
-  return withCors(json({ ok: true, authenticated: false }), request, env);
+  const headers = new Headers({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  headers.append("Set-Cookie", clearAdminSessionCookie());
+  return withCors(new Response(JSON.stringify({ ok: true, authenticated: false }), { status: 200, headers }), request, env);
 }
 
 async function handleAdminSession(request, env) {
-  return withCors(json({ authenticated: false }), request, env);
+  const authenticated = await isAdminAuthorized(request, env);
+  return withCors(json({ authenticated }), request, env);
+}
+
+async function isAdminAuthorized(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  if (auth === `Bearer ${env.ADMIN_TOKEN}`) return true;
+  return verifyAdminSessionCookie(request, env);
 }
 
 async function parseIncomingTranslateRequest(request) {
@@ -271,7 +325,9 @@ async function disableKeyPermanent(env, keyId, errorCode, errorMessage) {
 async function fetchUsage(key) {
   const resp = await fetch(`${key.endpoint}/v2/usage`, { headers: { Authorization: `DeepL-Auth-Key ${key.auth_key}` } });
   const text = await resp.text();
-  return { ok: resp.ok, data: JSON.parse(text || "null"), text };
+  let data = null;
+  try { data = JSON.parse(text || "null"); } catch {}
+  return { ok: resp.ok, status: resp.status, data, text };
 }
 
 async function getActiveKeys(env) {
@@ -279,11 +335,48 @@ async function getActiveKeys(env) {
   return rs.results || [];
 }
 
+async function updateUsageSnapshot(env, keyId, data) {
+  const now = Date.now();
+  await env.DB.prepare("UPDATE deepl_keys SET character_count=?, character_limit=?, last_checked_at=?, updated_at=? WHERE id=?")
+    .bind(numberOrNull(data?.character_count), numberOrNull(data?.character_limit), now, now, keyId)
+    .run();
+}
+
+function shouldSampleUsageRefresh(env) {
+  const raw = Number(env.USAGE_REFRESH_SAMPLE_RATE ?? 0.05);
+  const rate = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0.05;
+  return Math.random() < rate;
+}
+
+async function refreshUsageSnapshotSafely(env, key) {
+  try {
+    if ((key.site_type || "deepl_pro") === "official") return;
+    const usage = await fetchUsage(key);
+    if (usage.ok && usage.data) await updateUsageSnapshot(env, key.id, usage.data);
+  } catch {}
+}
+
 async function ensureSchema(env) {
   await env.DB
     .prepare("CREATE TABLE IF NOT EXISTS deepl_keys (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,auth_key TEXT NOT NULL,endpoint TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',disable_type TEXT,disabled_until INTEGER,last_error_code TEXT,last_error_message TEXT,character_count INTEGER,character_limit INTEGER,created_at INTEGER,updated_at INTEGER)")
     .run();
-  await env.DB.prepare("ALTER TABLE deepl_keys ADD COLUMN site_type TEXT DEFAULT 'deepl_pro'").run().catch(() => {});
+  const alters = [
+    "ALTER TABLE deepl_keys ADD COLUMN site_type TEXT DEFAULT 'deepl_pro'",
+    "ALTER TABLE deepl_keys ADD COLUMN last_used_at INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN last_checked_at INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN disabled_until INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN disable_type TEXT",
+    "ALTER TABLE deepl_keys ADD COLUMN last_error_code TEXT",
+    "ALTER TABLE deepl_keys ADD COLUMN last_error_message TEXT",
+    "ALTER TABLE deepl_keys ADD COLUMN character_count INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN character_limit INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN created_at INTEGER",
+    "ALTER TABLE deepl_keys ADD COLUMN updated_at INTEGER"
+  ];
+  for (const sql of alters) {
+    await env.DB.prepare(sql).run().catch(() => {});
+  }
+  await env.DB.prepare("UPDATE deepl_keys SET site_type='deepl_pro' WHERE site_type IS NULL OR site_type = ''").run().catch(() => {});
 }
 
 function handleOptions(request, env) {
@@ -310,6 +403,89 @@ function applyCorsHeaders(headers, request, env) {
   }
 }
 
+async function createAdminSessionCookie(env) {
+  const ttl = getAdminSessionTTLSeconds(env);
+  const now = Date.now();
+  const payload = encodeBase64UrlFromString(JSON.stringify({ iat: now, exp: now + ttl * 1000 }));
+  const signature = await signAdminSessionPayload(payload, env);
+  const value = `${payload}.${signature}`;
+  return buildCookieString("admin_session", value, { path: "/", httpOnly: true, secure: true, sameSite: "Lax", maxAge: ttl });
+}
+
+function clearAdminSessionCookie() {
+  return buildCookieString("admin_session", "", { path: "/", httpOnly: true, secure: true, sameSite: "Lax", maxAge: 0 });
+}
+
+async function verifyAdminSessionCookie(request, env) {
+  try {
+    const cookies = parseCookieHeader(request.headers.get("Cookie") || "");
+    const raw = cookies.admin_session;
+    if (!raw) return false;
+    const dotIndex = raw.lastIndexOf(".");
+    if (dotIndex <= 0) return false;
+    const payload = raw.slice(0, dotIndex);
+    const sig = raw.slice(dotIndex + 1);
+    const expected = await signAdminSessionPayload(payload, env);
+    if (sig !== expected) return false;
+    const data = JSON.parse(decodeBase64UrlToString(payload));
+    return typeof data?.exp === "number" && Date.now() < data.exp;
+  } catch {
+    return false;
+  }
+}
+
+async function signAdminSessionPayload(payload, env) {
+  const secret = String(env.ADMIN_COOKIE_SECRET || env.ADMIN_TOKEN || "");
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+function getAdminSessionTTLSeconds(env) {
+  const raw = Number(env.ADMIN_SESSION_TTL_SECONDS || 12 * 60 * 60);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 12 * 60 * 60;
+}
+
+function buildCookieString(name, value, options = {}) {
+  const parts = [`${name}=${value}`];
+  if (options.path) parts.push(`Path=${options.path}`);
+  if (options.maxAge != null) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.secure) parts.push("Secure");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  return parts.join("; ");
+}
+
+function parseCookieHeader(cookieHeader) {
+  const out = {};
+  for (const pair of String(cookieHeader || "").split(";")) {
+    const idx = pair.indexOf("=");
+    if (idx <= 0) continue;
+    out[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+function encodeBase64UrlFromString(input) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeBase64UrlToString(input) {
+  let b64 = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) b64 += "=";
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function getStartOfNextMonthBeijing(now = new Date()) {
   const beijingOffsetMs = 8 * 60 * 60 * 1000;
   const beijingNow = new Date(now.getTime() + beijingOffsetMs);
@@ -323,6 +499,10 @@ function truncate(text, max = 500) {
 
 function safeErrorMessage(err) {
   return err instanceof Error ? err.message : String(err || "Unknown error");
+}
+
+function numberOrNull(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 function json(data, status = 200) {

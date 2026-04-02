@@ -7,12 +7,34 @@
   <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
-  <main class="container">
-    <h1>DeepL Gateway 管理台</h1>
+  <div id="authModal" class="modal-mask" hidden>
+    <div class="modal">
+      <h2>管理员验证</h2>
+      <p>请输入 <span class="mono">ADMIN_TOKEN</span> 登录后台。</p>
+      <input id="tokenInput" class="input" type="password" placeholder="请输入 ADMIN_TOKEN" />
+      <div id="modalError" class="error-text"></div>
+      <div class="modal-actions"><button id="verifyBtn" class="primary">验证并进入</button></div>
+    </div>
+  </div>
+
+  <main id="app" class="container" hidden>
+    <div class="header">
+      <div>
+        <h1 class="title">DeepL Gateway 管理台</h1>
+        <p class="subtitle">支持 Key 增删改查、状态查看与手动刷新 usage。</p>
+      </div>
+      <div class="actions">
+        <button id="reloadBtn">刷新列表</button>
+        <button id="refreshUsageBtn" class="primary">刷新 Usage</button>
+        <button id="logoutBtn" class="danger">退出登录</button>
+      </div>
+    </div>
+
+    <div id="statusBar" class="status-bar"></div>
 
     <section class="panel">
       <h2>新增 Key</h2>
-      <div class="row">
+      <div class="row form-grid">
         <input id="name" placeholder="Name" />
         <input id="auth" placeholder="Auth Key" />
         <input id="endpoint" placeholder="Endpoint" />
@@ -20,23 +42,19 @@
           <option value="deepl_pro">deepl-pro.com</option>
           <option value="official">official</option>
         </select>
-        <button id="addBtn">新增</button>
+        <button id="addBtn" class="primary">新增</button>
       </div>
-      <p id="msg"></p>
     </section>
 
     <section class="panel">
       <h2>Key 列表</h2>
       <table>
-        <thead>
-          <tr>
-            <th>ID</th><th>Name</th><th>Endpoint</th><th>Type</th><th>Status</th><th>Action</th>
-          </tr>
-        </thead>
+        <thead><tr><th>ID</th><th>Name</th><th>Endpoint</th><th>Type</th><th>Status</th><th>Usage</th><th>Last Error</th><th>Action</th></tr></thead>
         <tbody id="tb"></tbody>
       </table>
     </section>
   </main>
+
   <script type="module" src="/webui/app.js"></script>
 </body>
 </html>
