@@ -285,6 +285,7 @@ async function parseIncomingTranslateRequest(request) {
     const texts = Array.isArray(body.text) ? body.text : [body.text];
     for (const text of texts) form.append("text", text);
     form.append("target_lang", String(body.target_lang).toUpperCase());
+    appendTranslateOptionsToForm(form, body);
     return { ok: true, form, cacheIdentity: normalizeJsonBodyForCache(body) };
   }
 
@@ -294,6 +295,33 @@ async function parseIncomingTranslateRequest(request) {
     return { ok: false, status: 400, error: "text and target_lang are required" };
   }
   return { ok: true, form, cacheIdentity: normalizeFormParamsForCache(form) };
+}
+
+function appendTranslateOptionsToForm(form, body) {
+  const fields = [
+    "source_lang",
+    "formality",
+    "glossary_id",
+    "context",
+    "model_type",
+    "split_sentences",
+    "preserve_formatting",
+    "tag_handling",
+    "outline_detection",
+  ];
+  for (const field of fields) {
+    if (body[field] != null) form.append(field, String(body[field]));
+  }
+  appendMultiValueField(form, body.non_splitting_tags, "non_splitting_tags");
+  appendMultiValueField(form, body.splitting_tags, "splitting_tags");
+  appendMultiValueField(form, body.ignore_tags, "ignore_tags");
+}
+
+function appendMultiValueField(form, value, fieldName) {
+  if (!Array.isArray(value)) return;
+  for (const item of value) {
+    if (item != null) form.append(fieldName, String(item));
+  }
 }
 
 function classifyDeepLError(status, text, siteType) {
@@ -373,24 +401,9 @@ async function refreshUsageSnapshotSafely(env, key) {
 
 async function ensureSchema(env) {
   await env.DB
-    .prepare("CREATE TABLE IF NOT EXISTS deepl_keys (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,auth_key TEXT NOT NULL,endpoint TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',disable_type TEXT,disabled_until INTEGER,last_error_code TEXT,last_error_message TEXT,character_count INTEGER,character_limit INTEGER,created_at INTEGER,updated_at INTEGER)")
+    .prepare("CREATE TABLE IF NOT EXISTS deepl_keys (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,auth_key TEXT NOT NULL,endpoint TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',disable_type TEXT,disabled_until INTEGER,last_error_code TEXT,last_error_message TEXT,last_used_at INTEGER,last_checked_at INTEGER,character_count INTEGER,character_limit INTEGER,created_at INTEGER,updated_at INTEGER)")
     .run();
-  const alters = [
-    "ALTER TABLE deepl_keys ADD COLUMN last_used_at INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN last_checked_at INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN disabled_until INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN disable_type TEXT",
-    "ALTER TABLE deepl_keys ADD COLUMN last_error_code TEXT",
-    "ALTER TABLE deepl_keys ADD COLUMN last_error_message TEXT",
-    "ALTER TABLE deepl_keys ADD COLUMN character_count INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN character_limit INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN created_at INTEGER",
-    "ALTER TABLE deepl_keys ADD COLUMN updated_at INTEGER"
-  ];
-  for (const sql of alters) {
-    await env.DB.prepare(sql).run().catch(() => {});
-  }
-  await env.DB.prepare("ALTER TABLE deepl_keys DROP COLUMN site_type").run().catch(() => {});
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_deepl_keys_status_id ON deepl_keys(status, id)").run();
 }
 
 function detectProviderByEndpoint(endpoint) {
