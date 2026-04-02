@@ -19,3 +19,8 @@ database_name = "deepl-gateway-db"
 [assets]
 directory = "./webui"
 binding = "ASSETS"
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
