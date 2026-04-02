@@ -1,25 +1,32 @@
 ## Deepl Proxy Worker
 
-### 前后端分离
-- 后端 Worker 业务逻辑在 `src/index.js`。
-- 管理台静态页面在 `webui/`（`index.html` / `app.js` / `style.css`）。
-- 通过 `wrangler.toml` 的 `[assets]` 绑定由 Cloudflare 提供静态资源。
+### 为什么部署后变量和 D1 绑定会“消失”？
+Cloudflare 部署时会把 `wrangler.toml` 当作**期望状态**。
+- 如果你只在 Dashboard 手动加了绑定/变量，但 `wrangler.toml` 没声明，部署后就可能被覆盖掉。
+- 你之前配置里没有 `[[d1_databases]]`，所以部署时 `DB` 绑定会被移除，进而出现 `Cannot read properties of undefined (reading 'prepare')`。
 
-### 部署方式（可自由选）
-#### 方式 A：Cloudflare Git 集成（推荐）
-1. Workers & Pages -> Create -> Workers -> Import a repository。
-2. 选择仓库后，Deploy command 使用 `npx wrangler deploy`。
-3. 设置环境变量：`GATEWAY_TOKEN`、`ADMIN_TOKEN`、`ALLOW_ORIGIN` 等。
-4. 后续仓库更新由 Cloudflare 自动检测并部署。
+### 本仓库已做的修复
+1. 增加 `keep_vars = true`，保留 Dashboard 里手动配置的 Variables/Secrets。
+2. 在 `wrangler.toml` 中显式声明 `[[d1_databases]]`，绑定名固定为 `DB`。
 
-#### 方式 B：本地/NPM 手动部署
+### 你需要做的事
+1. 打开 `wrangler.toml`，把：
+   - `database_name`
+   - `database_id`
+   改成你自己的 D1 信息。
+2. 重新部署（Cloudflare Git 或 `wrangler deploy`）。
+3. 确认 Dashboard -> Settings 里能看到：
+   - Variables/Secrets（含 `ADMIN_TOKEN`, `GATEWAY_TOKEN` 等）
+   - D1 binding：`DB`
+
+### 前后端分离结构
+- 后端 Worker：`src/index.js`
+- 管理台静态资源：`webui/index.html`, `webui/app.js`, `webui/style.css`
+
+### 部署方式
+- Cloudflare Git 集成：仓库更新自动部署
+- 本地部署：
 ```bash
 npm i -g wrangler
 wrangler deploy
 ```
-
-### 功能说明
-- 支持 deepl-pro.com 与官方 DeepL 中转（`site_type`）。
-- deepl-pro key 在 quota/limit 场景下永久禁用（不自动解封）。
-- official key 可不支持 usage（仅 official key 时 `/v2/usage` 返回 501）。
-- WebUI 支持 key 增删改查。
