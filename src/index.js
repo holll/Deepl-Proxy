@@ -1,7 +1,6 @@
 export default {
   async fetch(request, env) {
     try {
-      await ensureSchema(env);
       const url = new URL(request.url);
 
       if (request.method === "OPTIONS") return handleOptions(request, env);
@@ -13,6 +12,8 @@ export default {
       if (url.pathname.startsWith("/webui")) {
         return serveWebUI(request, env);
       }
+
+      await ensureSchema(env);
 
       // Admin auth/session
       if (url.pathname === "/admin/login" && request.method === "POST") return handleAdminLogin(request, env);
@@ -41,7 +42,14 @@ async function serveWebUI(request, env) {
   if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
     return withCors(json({ error: "ASSETS binding is not configured" }, 500), request, env);
   }
-  const response = await env.ASSETS.fetch(request);
+
+  const originalUrl = new URL(request.url);
+  const assetPath = originalUrl.pathname === "/webui" ? "/" : originalUrl.pathname.replace(/^\/webui/, "") || "/";
+  const assetUrl = new URL(request.url);
+  assetUrl.pathname = assetPath;
+
+  const assetRequest = new Request(assetUrl.toString(), request);
+  const response = await env.ASSETS.fetch(assetRequest);
   return withCors(response, request, env);
 }
 
