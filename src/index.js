@@ -376,6 +376,7 @@ async function ensureSchema(env) {
   for (const sql of alters) {
     await env.DB.prepare(sql).run().catch(() => {});
   }
+  await env.DB.prepare("UPDATE deepl_keys SET site_type='deepl_pro' WHERE site_type IS NULL OR site_type = ''").run().catch(() => {});
 }
 
 function handleOptions(request, env) {

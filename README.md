@@ -19,6 +19,35 @@ Cloudflare 部署时会把 `wrangler.toml` 当作**期望状态**。
    - Variables/Secrets（含 `ADMIN_TOKEN`, `GATEWAY_TOKEN` 等）
    - D1 binding：`DB`
 
+### 与你现有 `deepl_keys` 表结构兼容性
+你给的结构：
+```sql
+CREATE TABLE deepl_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  auth_key TEXT NOT NULL,
+  endpoint TEXT NOT NULL DEFAULT 'https://api.deepl-pro.com',
+  status TEXT NOT NULL DEFAULT 'active',
+  disable_type TEXT,
+  disabled_until INTEGER,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  last_used_at INTEGER,
+  last_checked_at INTEGER,
+  character_count INTEGER,
+  character_limit INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+```
+是**基本兼容**的。当前代码只额外需要 `site_type` 字段（`deepl_pro`/`official`），启动时会自动尝试 `ALTER TABLE` 补齐并把旧数据回填为 `deepl_pro`。
+
+如果你想手动迁移，可执行：
+```sql
+ALTER TABLE deepl_keys ADD COLUMN site_type TEXT DEFAULT 'deepl_pro';
+UPDATE deepl_keys SET site_type = 'deepl_pro' WHERE site_type IS NULL OR site_type = '';
+```
+
 ### 前后端分离结构
 - 后端 Worker：`src/index.js`
 - 管理台静态资源：`webui/index.html`, `webui/app.js`, `webui/style.css`
