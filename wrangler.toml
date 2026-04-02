@@ -8,7 +8,6 @@ keep_vars = true
 
 [vars]
 ALLOW_ORIGIN = "*"
-CACHE_TTL_SECONDS = "0"
 
 # 把 D1 绑定声明写入配置，避免部署时丢失绑定。
 # 请替换为你自己的 database_id。
