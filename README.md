@@ -48,6 +48,15 @@ CREATE TABLE deepl_keys (
 - 后端 Worker：`src/index.js`
 - 管理台静态资源：`webui/index.html`, `webui/app.js`, `webui/style.css`
 
+### 翻译结果缓存（Cloudflare Cache）
+- 变量 `CACHE_TTL_SECONDS` 用于控制翻译结果缓存秒数（`>0` 开启，`<=0` 关闭）。
+- 命中条件：相同的翻译请求参数（`text`、`target_lang` 等）会命中同一个缓存键。
+- 命中后会直接返回缓存结果，不再请求上游 DeepL API。
+- 响应头 `X-Cache-Status`：
+  - `HIT`：命中缓存；
+  - `MISS`：未命中，已请求上游并回填缓存。
+- 如需临时跳过缓存，可在请求头加 `x-no-cache: 1`。
+
 ### 部署方式
 - Cloudflare Git 集成：仓库更新自动部署
 - 本地部署：

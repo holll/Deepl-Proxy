@@ -64,6 +64,16 @@ async function handleTranslateCompat(request, env, ctx) {
 
   const clientReq = await parseIncomingTranslateRequest(request);
   if (!clientReq.ok) return withCors(json({ message: clientReq.error }, clientReq.status || 400), request, env);
+  const cacheTTL = getCacheTTLSeconds(env);
+  const shouldBypassCache = isNoCacheRequest(request);
+  const cacheKey = !shouldBypassCache && cacheTTL > 0 ? await buildTranslateCacheKey(request, clientReq.form) : null;
+
+  if (cacheKey) {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      return withCors(withCacheStatus(cached, "HIT"), request, env);
+    }
+  }
 
   const activeKeys = await getActiveKeys(env);
   if (!activeKeys.length) return withCors(json({ message: "No available keys" }, 503), request, env);
@@ -90,6 +100,20 @@ async function handleTranslateCompat(request, env, ctx) {
             "X-Key-Site-Type": detectProviderByEndpoint(key.endpoint),
           },
         });
+        if (resp.ok && cacheKey) {
+          const cacheable = new Response(text, {
+            status: resp.status,
+            headers: {
+              "Content-Type": passthrough.headers.get("Content-Type") || "application/json; charset=utf-8",
+              "Cache-Control": `public, max-age=${cacheTTL}`,
+            },
+          });
+          ctx.waitUntil(caches.default.put(cacheKey, cacheable));
+          if (shouldSampleUsageRefresh(env)) {
+            ctx.waitUntil(refreshUsageSnapshotSafely(env, key));
+          }
+          return withCors(withCacheStatus(passthrough, "MISS"), request, env);
+        }
         if (resp.ok && shouldSampleUsageRefresh(env)) {
           ctx.waitUntil(refreshUsageSnapshotSafely(env, key));
         }
@@ -505,6 +529,32 @@ function safeErrorMessage(err) {
 
 function numberOrNull(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function getCacheTTLSeconds(env) {
+  const raw = Number(env.CACHE_TTL_SECONDS ?? 0);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
+function isNoCacheRequest(request) {
+  return request.headers.get("x-no-cache") === "1";
+}
+
+async function buildTranslateCacheKey(request, form) {
+  const hash = await sha256Hex(form.toString());
+  const url = new URL(request.url);
+  return new Request(`${url.origin}/__cache/translate?hash=${hash}`, { method: "GET" });
+}
+
+async function sha256Hex(input) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(input || "")));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function withCacheStatus(response, status) {
+  const headers = new Headers(response.headers);
+  headers.set("X-Cache-Status", status);
+  return new Response(response.body, { status: response.status, headers });
 }
 
 function json(data, status = 200) {
