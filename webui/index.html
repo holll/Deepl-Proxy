@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepL Gateway Admin</title>
+  <link rel="stylesheet" href="/webui/style.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>DeepL Gateway 管理台</h1>
+
+    <section class="panel">
+      <h2>新增 Key</h2>
+      <div class="row">
+        <input id="name" placeholder="Name" />
+        <input id="auth" placeholder="Auth Key" />
+        <input id="endpoint" placeholder="Endpoint" />
+        <select id="siteType">
+          <option value="deepl_pro">deepl-pro.com</option>
+          <option value="official">official</option>
+        </select>
+        <button id="addBtn">新增</button>
+      </div>
+      <p id="msg"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Key 列表</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Name</th><th>Endpoint</th><th>Type</th><th>Status</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="tb"></tbody>
+      </table>
+    </section>
+  </main>
+  <script type="module" src="/webui/app.js"></script>
+</body>
+</html>

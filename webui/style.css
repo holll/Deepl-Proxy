@@ -1,0 +1,7 @@
+body { font-family: sans-serif; margin: 0; background: #f5f7fb; }
+.container { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+.panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.row { display: grid; grid-template-columns: 1fr 1fr 1fr 160px 120px; gap: 8px; }
+input, select, button { padding: 8px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border: 1px solid #e5e7eb; padding: 8px; }
