@@ -25,17 +25,16 @@ function rowTemplate(k) {
     <td>${k.id}</td>
     <td contenteditable onblur="window.upd(${k.id}, 'name', this.innerText)">${k.name || ''}</td>
     <td class="mono" contenteditable onblur="window.upd(${k.id}, 'endpoint', this.innerText)">${k.endpoint || ''}</td>
-    <td><select onchange="window.upd(${k.id}, 'site_type', this.value)"><option value="deepl_pro" ${k.site_type === 'deepl_pro' ? 'selected' : ''}>deepl-pro.com</option><option value="official" ${k.site_type === 'official' ? 'selected' : ''}>official</option></select></td>
     <td><select onchange="window.upd(${k.id}, 'status', this.value)"><option value="active" ${k.status === 'active' ? 'selected' : ''}>active</option><option value="disabled" ${k.status === 'disabled' ? 'selected' : ''}>disabled</option><option value="dead" ${k.status === 'dead' ? 'selected' : ''}>dead</option></select></td>
     <td>${usage}</td><td class="mono">${err}</td>
     <td><button onclick="window.delKey(${k.id})">删除</button></td>
   </tr>`;
 }
 
-async function loadKeys(){ setStatus('正在加载列表...'); const data=await api('/admin/keys'); el.tb.innerHTML=(data.keys||[]).map(rowTemplate).join('')||'<tr><td colspan="8">暂无数据</td></tr>'; setStatus('列表已更新','success'); }
+async function loadKeys(){ setStatus('正在加载列表...'); const data=await api('/admin/keys'); el.tb.innerHTML=(data.keys||[]).map(rowTemplate).join('')||'<tr><td colspan="7">暂无数据</td></tr>'; setStatus('列表已更新','success'); }
 
 async function addKey(){
-  const payload = { name: document.getElementById('name').value.trim(), auth_key: document.getElementById('auth').value.trim(), endpoint: document.getElementById('endpoint').value.trim(), site_type: document.getElementById('siteType').value };
+  const payload = { name: document.getElementById('name').value.trim(), auth_key: document.getElementById('auth').value.trim(), endpoint: document.getElementById('endpoint').value.trim() };
   await api('/admin/keys',{ method:'POST', body: JSON.stringify(payload)}); setStatus('新增成功','success'); await loadKeys();
 }
 window.upd = async (id, field, value) => { await api(`/admin/keys/${id}`, { method: 'PUT', body: JSON.stringify({ [field]: value }) }); setStatus('更新成功','success'); };

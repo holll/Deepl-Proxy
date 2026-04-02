@@ -87,7 +87,7 @@ async function handleTranslateCompat(request, env, ctx) {
           headers: {
             "Content-Type": resp.headers.get("Content-Type") || "application/json; charset=utf-8",
             "X-Upstream-Key-Name": key.name || "",
-            "X-Key-Site-Type": key.site_type || "deepl_pro",
+            "X-Key-Site-Type": detectProviderByEndpoint(key.endpoint),
           },
         });
         if (resp.ok && shouldSampleUsageRefresh(env)) {
@@ -96,7 +96,7 @@ async function handleTranslateCompat(request, env, ctx) {
         return withCors(passthrough, request, env);
       }
 
-      const errorType = classifyDeepLError(resp.status, text, key.site_type);
+      const errorType = classifyDeepLError(resp.status, text, detectProviderByEndpoint(key.endpoint));
       await applyDisableByType(env, key.id, errorType, String(resp.status), text);
       lastFailure = { key: key.name, status: resp.status, body: truncate(text, 160) };
     } catch (err) {
@@ -115,7 +115,7 @@ async function handleUsageCompat(request, env) {
   const keys = await getActiveKeys(env);
   if (!keys.length) return withCors(json({ message: "No available keys" }, 503), request, env);
 
-  const nonOfficial = keys.filter((k) => (k.site_type || "deepl_pro") !== "official");
+  const nonOfficial = keys.filter((k) => detectProviderByEndpoint(k.endpoint) !== "official");
   if (!nonOfficial.length) {
     return withCors(json({ message: "Usage API not supported for official site keys" }, 501), request, env);
   }
@@ -130,7 +130,7 @@ async function handleUsageCompat(request, env) {
 async function handleAdminKeys(request, env) {
   const authError = await verifyAdminAuth(request, env);
   if (authError) return withCors(authError, request, env);
-  const rs = await env.DB.prepare("SELECT id,name,endpoint,site_type,status,disable_type,disabled_until,last_error_code,last_error_message,last_used_at,last_checked_at,character_count,character_limit,created_at,updated_at FROM deepl_keys ORDER BY id ASC").all();
+  const rs = await env.DB.prepare("SELECT id,name,endpoint,status,disable_type,disabled_until,last_error_code,last_error_message,last_used_at,last_checked_at,character_count,character_limit,created_at,updated_at FROM deepl_keys ORDER BY id ASC").all();
   const keys = (rs.results || []).map((row) => ({
     ...row,
     disabled_until_iso: row.disabled_until ? new Date(row.disabled_until).toISOString() : null,
@@ -153,12 +153,11 @@ async function handleAdminKeyCreate(request, env) {
 
   const now = Date.now();
   await env.DB
-    .prepare("INSERT INTO deepl_keys (name,auth_key,endpoint,site_type,status,created_at,updated_at) VALUES (?,?,?,?, 'active',?,?)")
+    .prepare("INSERT INTO deepl_keys (name,auth_key,endpoint,status,created_at,updated_at) VALUES (?,?,?, 'active',?,?)")
     .bind(
       String(body.name),
       String(body.auth_key),
       String(body.endpoint).replace(/\/$/, ""),
-      body.site_type === "official" ? "official" : "deepl_pro",
       now,
       now
     )
@@ -173,12 +172,11 @@ async function handleAdminKeyUpdate(request, env, id) {
   const now = Date.now();
 
   await env.DB
-    .prepare("UPDATE deepl_keys SET name=COALESCE(?,name),auth_key=COALESCE(?,auth_key),endpoint=COALESCE(?,endpoint),site_type=COALESCE(?,site_type),status=COALESCE(?,status),updated_at=? WHERE id=?")
+    .prepare("UPDATE deepl_keys SET name=COALESCE(?,name),auth_key=COALESCE(?,auth_key),endpoint=COALESCE(?,endpoint),status=COALESCE(?,status),updated_at=? WHERE id=?")
     .bind(
       body.name ?? null,
       body.auth_key ?? null,
       body.endpoint ? String(body.endpoint).replace(/\/$/, "") : null,
-      body.site_type ?? null,
       body.status ?? null,
       now,
       id
@@ -201,7 +199,7 @@ async function handleUsageRefresh(request, env) {
   const results = [];
   for (const key of keys) {
     try {
-      if ((key.site_type || "deepl_pro") === "official") {
+      if (detectProviderByEndpoint(key.endpoint) === "official") {
         results.push({ key: key.name, ok: false, skipped: "official_usage_not_supported" });
         continue;
       }
@@ -350,7 +348,7 @@ function shouldSampleUsageRefresh(env) {
 
 async function refreshUsageSnapshotSafely(env, key) {
   try {
-    if ((key.site_type || "deepl_pro") === "official") return;
+    if (detectProviderByEndpoint(key.endpoint) === "official") return;
     const usage = await fetchUsage(key);
     if (usage.ok && usage.data) await updateUsageSnapshot(env, key.id, usage.data);
   } catch {}
@@ -361,7 +359,6 @@ async function ensureSchema(env) {
     .prepare("CREATE TABLE IF NOT EXISTS deepl_keys (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,auth_key TEXT NOT NULL,endpoint TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',disable_type TEXT,disabled_until INTEGER,last_error_code TEXT,last_error_message TEXT,character_count INTEGER,character_limit INTEGER,created_at INTEGER,updated_at INTEGER)")
     .run();
   const alters = [
-    "ALTER TABLE deepl_keys ADD COLUMN site_type TEXT DEFAULT 'deepl_pro'",
     "ALTER TABLE deepl_keys ADD COLUMN last_used_at INTEGER",
     "ALTER TABLE deepl_keys ADD COLUMN last_checked_at INTEGER",
     "ALTER TABLE deepl_keys ADD COLUMN disabled_until INTEGER",
@@ -376,7 +373,12 @@ async function ensureSchema(env) {
   for (const sql of alters) {
     await env.DB.prepare(sql).run().catch(() => {});
   }
-  await env.DB.prepare("UPDATE deepl_keys SET site_type='deepl_pro' WHERE site_type IS NULL OR site_type = ''").run().catch(() => {});
+  await env.DB.prepare("ALTER TABLE deepl_keys DROP COLUMN site_type").run().catch(() => {});
+}
+
+function detectProviderByEndpoint(endpoint) {
+  const value = String(endpoint || "").toLowerCase();
+  return value.includes("api.deepl.com") ? "official" : "deepl_pro";
 }
 
 function handleOptions(request, env) {

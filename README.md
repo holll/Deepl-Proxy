@@ -40,13 +40,9 @@ CREATE TABLE deepl_keys (
   updated_at INTEGER NOT NULL
 );
 ```
-是**基本兼容**的。当前代码只额外需要 `site_type` 字段（`deepl_pro`/`official`），启动时会自动尝试 `ALTER TABLE` 补齐并把旧数据回填为 `deepl_pro`。
+是**直接兼容**的。当前版本不再使用 `site_type` 字段，而是由 `endpoint` 自动推断 provider（`api.deepl.com` 视为 official，其它按 deepl-pro 处理）。
 
-如果你想手动迁移，可执行：
-```sql
-ALTER TABLE deepl_keys ADD COLUMN site_type TEXT DEFAULT 'deepl_pro';
-UPDATE deepl_keys SET site_type = 'deepl_pro' WHERE site_type IS NULL OR site_type = '';
-```
+如果你历史库中存在旧的 `site_type` 字段，代码会尝试自动删除（支持时生效，不支持则忽略，不影响运行）。
 
 ### 前后端分离结构
 - 后端 Worker：`src/index.js`
