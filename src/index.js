@@ -604,10 +604,24 @@ async function putCloudflareCacheOnly(cacheKey, body, headers, env) {
 async function getDbCachedTranslationResponse(cacheKey, env) {
   const now = Date.now();
   const row = await env.DB
-    .prepare("SELECT body, headers_json FROM deepl_translation_cache WHERE cache_key = ? AND expires_at > ?")
+    .prepare(`
+      SELECT body, headers_json
+      FROM deepl_translation_cache
+      WHERE cache_key = ? AND expires_at > ?
+    `)
     .bind(cacheKey, now)
     .first();
   if (!row) return null;
+  const ttl = getCacheTTLSeconds(env);
+  const newExpiresAt = now + ttl * 1000;
+  await env.DB
+    .prepare(`
+      UPDATE deepl_translation_cache
+      SET expires_at = ?
+      WHERE cache_key = ?
+    `)
+    .bind(newExpiresAt, cacheKey)
+    .run();
   let headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
   try {
     const parsed = JSON.parse(String(row.headers_json || "{}"));
