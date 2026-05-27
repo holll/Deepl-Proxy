@@ -1,0 +1,41 @@
+# Go 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+deepl-proxy
+deepl-proxy-test
+*.test
+
+# 构建输出目录
+dist/
+
+# Go build/module cache
+.gocache/
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE - GoLand / JetBrains
+.idea/
+
+# 配置文件（含敏感凭证）
+config.yaml
+
+# 数据文件
+data/
+*.db
+*.db-journal
+
+# 临时文件
+*.log
+*.tmp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# AI工具
+.codewhale/

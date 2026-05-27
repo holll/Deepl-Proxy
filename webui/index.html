@@ -3,54 +3,78 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DeepL Gateway Admin</title>
+  <title>Deepl Proxy - Admin</title>
+  <link rel="icon" type="image/svg+xml" href="/webui/favicon.svg" sizes="any">
+  <link rel="icon" type="image/png" sizes="16x16" href="/webui/favicon_16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/webui/favicon_32.png">
+  <link rel="icon" type="image/png" sizes="96x96" href="/webui/favicon_96.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/webui/apple-touch-icon.png">
   <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
-  <div id="authModal" class="modal-mask" hidden>
-    <div class="modal">
-      <h2>管理员验证</h2>
-      <p>请输入 <span class="mono">ADMIN_TOKEN</span> 登录后台。</p>
-      <input id="tokenInput" class="input" type="password" placeholder="请输入 ADMIN_TOKEN" />
-      <div id="modalError" class="error-text"></div>
-      <div class="modal-actions"><button id="verifyBtn" class="primary">验证并进入</button></div>
-    </div>
+
+<div id="login" class="login-overlay" hidden>
+  <div class="login-box">
+    <h2>管理员验证</h2>
+    <p>输入 <code>ADMIN_TOKEN</code> 登录</p>
+    <input id="tokenInput" type="password" placeholder="ADMIN_TOKEN" autofocus />
+    <div id="loginError" class="msg-error"></div>
+    <div class="login-actions"><button id="loginBtn" class="btn-primary">验证并进入</button></div>
   </div>
+</div>
 
-  <main id="app" class="container" hidden>
-    <div class="header">
-      <div>
-        <h1 class="title">DeepL Gateway 管理台</h1>
-        <p class="subtitle">支持 Key 增删改查、状态查看与手动刷新 usage。</p>
-      </div>
-      <div class="actions">
-        <button id="reloadBtn">刷新列表</button>
-        <button id="refreshUsageBtn" class="primary">刷新 Usage</button>
-        <button id="logoutBtn" class="danger">退出登录</button>
-      </div>
+<main id="app" hidden>
+  <header class="topbar">
+    <div>
+      <h1>Deepl Proxy 管理台</h1>
+      <span class="topbar-hint">多 Key 轮询 · 自动熔断 · SQLite 缓存</span>
     </div>
+    <div class="topbar-actions">
+      <button id="reloadBtn">刷新</button>
+      <button id="refreshUsageBtn" class="btn-primary">刷新用量</button>
+      <button id="logoutBtn" class="btn-danger">退出</button>
+    </div>
+  </header>
 
-    <div id="statusBar" class="status-bar"></div>
+  <div id="statusBar" class="status-bar"></div>
 
-    <section class="panel">
-      <h2>新增 Key</h2>
-      <div class="row form-grid">
-        <input id="name" placeholder="Name" />
-        <input id="auth" placeholder="Auth Key" />
-        <input id="endpoint" placeholder="Endpoint" />
-        <button id="addBtn" class="primary">新增</button>
-      </div>
-    </section>
+  <section class="card">
+    <h3>新增 Key</h3>
+    <div class="form-grid">
+      <div class="field"><label for="fName">Name</label><input id="fName" placeholder="my-key" /></div>
+      <div class="field"><label for="fAuth">Auth Key</label><input id="fAuth" placeholder="DeepL API key（deeplx 可留空）" /></div>
+      <div class="field"><label for="fEndpoint">Endpoint</label><input id="fEndpoint" placeholder="https://api.deepl-pro.com" /></div>
+      <div class="field"><label for="fProvider">Provider</label><select id="fProvider"><option value="deepl">deepl</option><option value="deeplx">deeplx</option></select></div>
+      <div class="field field-action"><label>&nbsp;</label><button id="addBtn" class="btn-primary">新增</button></div>
+    </div>
+  </section>
 
-    <section class="panel">
-      <h2>Key 列表</h2>
+  <section class="card">
+    <h3>Key 列表</h3>
+    <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Endpoint</th><th>Status</th><th>Usage</th><th>Last Error</th><th>Action</th></tr></thead>
+        <thead>
+          <tr><th>ID</th><th>Name</th><th>Endpoint</th><th>Provider</th><th>Status</th><th>禁用原因</th><th>截至</th><th>用量</th><th>操作</th></tr>
+        </thead>
         <tbody id="tb"></tbody>
       </table>
-    </section>
-  </main>
+    </div>
+  </section>
 
-  <script type="module" src="/webui/app.js"></script>
+  <section class="card">
+    <h3>缓存管理 <span id="cacheCount" class="sub-text"></span></h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Cache Key</th><th>译文预览</th><th>大小</th><th>创建时间</th><th>过期时间</th><th>状态</th><th>操作</th></tr>
+        </thead>
+        <tbody id="cacheTb"></tbody>
+      </table>
+    </div>
+    <div class="cache-pager" id="cachePager"></div>
+  </section>
+</main>
+
+<script src="/webui/app.js"></script>
 </body>
 </html>

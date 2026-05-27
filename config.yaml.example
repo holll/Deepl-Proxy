@@ -1,0 +1,26 @@
+server:
+  port: "8080"
+  allow_origin: "*"
+
+auth:
+  # 管理后台登录密码
+  admin_token: "your-admin-token"
+  # 客户端调用翻译 API 的鉴权令牌
+  gateway_token: "your-gateway-token"
+  # 管理后台 Cookie 加密密钥（随机字符串，建议 32 位以上）
+  admin_cookie_secret: "your-random-secret"
+  # 管理员会话有效期（秒），默认 12 小时
+  session_ttl: 43200
+
+database:
+  path: "./data/deepl-proxy.db"
+
+cache:
+  # 翻译缓存 TTL（秒），0 表示不缓存
+  ttl_days: 365
+  # 过期缓存清理间隔（秒）
+  cleanup_interval: 3600
+  # 每次清理批次大小
+  cleanup_batch_size: 500
+  # 每轮最多清理轮数
+  cleanup_max_rounds: 20
