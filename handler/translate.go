@@ -64,7 +64,7 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.CacheService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 解析请求（支持 JSON 和 form-urlencoded）
-		texts, targetLang, sourceLang, extraParams, identity, err := parseTranslateRequest(c)
+		texts, targetLang, sourceLang, extraParams, tagArrayParams, identity, err := parseTranslateRequest(c)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 			return
@@ -109,13 +109,23 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 		for k, v := range extraParams {
 			formValues.Set(k, v)
 		}
+		// 添加数组型 tag 参数（如 non_splitting_tags=S1&non_splitting_tags=S2）
+		for k, vs := range tagArrayParams {
+			for _, v := range vs {
+				formValues.Add(k, v)
+			}
+		}
 
 		// 构建 provider request
 		req := &provider.TranslateRequest{
-			Text:       texts,
-			TargetLang: targetLang,
-			SourceLang: sourceLang,
-			FormParams: formValues.Encode(),
+			Text:             texts,
+			TargetLang:       targetLang,
+			SourceLang:       sourceLang,
+			FormParams:       formValues.Encode(),
+			TagHandling:      extraParams["tag_handling"],
+			NonSplittingTags: tagArrayParams["non_splitting_tags"],
+			SplittingTags:    tagArrayParams["splitting_tags"],
+			IgnoreTags:       tagArrayParams["ignore_tags"],
 		}
 
 		// 轮询 key
@@ -162,15 +172,16 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 	}
 }
 
-func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLang string, extraParams map[string]string, identity *models.CacheIdentity, err error) {
+func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLang string, extraParams map[string]string, tagArrayParams map[string][]string, identity *models.CacheIdentity, err error) {
 	extraParams = make(map[string]string)
+	tagArrayParams = make(map[string][]string)
 
 	ct := c.GetHeader("Content-Type")
 
 	if strings.Contains(ct, "application/json") {
 		var body map[string]any
 		if err := c.ShouldBindJSON(&body); err != nil {
-			return nil, "", "", nil, nil, err
+			return nil, "", "", nil, nil, nil, err
 		}
 
 		// 解析 text
@@ -182,15 +193,15 @@ func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLa
 				texts = append(texts, toString(item))
 			}
 		default:
-			return nil, "", "", nil, nil, fmtStr("text is required")
+			return nil, "", "", nil, nil, nil, fmtStr("text is required")
 		}
 		if len(texts) == 0 {
-			return nil, "", "", nil, nil, fmtStr("text is required")
+			return nil, "", "", nil, nil, nil, fmtStr("text is required")
 		}
 
 		tl, ok := body["target_lang"].(string)
 		if !ok || tl == "" {
-			return nil, "", "", nil, nil, fmtStr("target_lang is required")
+			return nil, "", "", nil, nil, nil, fmtStr("target_lang is required")
 		}
 		targetLang = tl
 
@@ -198,7 +209,7 @@ func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLa
 			sourceLang = sl
 		}
 
-		// 提取 extra params
+		// 提取 extra params（标量）
 		extraFields := []string{"formality", "glossary_id", "context", "model_type", "split_sentences", "preserve_formatting", "tag_handling", "outline_detection"}
 		for _, f := range extraFields {
 			if v, ok := body[f].(string); ok {
@@ -206,22 +217,34 @@ func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLa
 			}
 		}
 
+		// 提取数组型 tag 参数
+		tagArrayFields := []string{"non_splitting_tags", "splitting_tags", "ignore_tags"}
+		for _, f := range tagArrayFields {
+			if arr, ok := body[f].([]any); ok {
+				for _, item := range arr {
+					if s, ok := item.(string); ok {
+						tagArrayParams[f] = append(tagArrayParams[f], s)
+					}
+				}
+			}
+		}
+
 		identity = normalizeJSONIdentity(body)
 	} else {
 		// form-urlencoded
 		if err := c.Request.ParseForm(); err != nil {
-			return nil, "", "", nil, nil, err
+			return nil, "", "", nil, nil, nil, err
 		}
 		form := c.Request.PostForm
 
 		texts = form["text"]
 		if len(texts) == 0 {
-			return nil, "", "", nil, nil, fmtStr("text is required")
+			return nil, "", "", nil, nil, nil, fmtStr("text is required")
 		}
 
 		targetLang = form.Get("target_lang")
 		if targetLang == "" {
-			return nil, "", "", nil, nil, fmtStr("target_lang is required")
+			return nil, "", "", nil, nil, nil, fmtStr("target_lang is required")
 		}
 
 		sourceLang = form.Get("source_lang")
@@ -230,6 +253,14 @@ func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLa
 		for _, f := range extraFields {
 			if v := form.Get(f); v != "" {
 				extraParams[f] = v
+			}
+		}
+
+		// 提取数组型 tag 参数（form 中为重复字段）
+		tagArrayFields := []string{"non_splitting_tags", "splitting_tags", "ignore_tags"}
+		for _, f := range tagArrayFields {
+			if vs := form[f]; len(vs) > 0 {
+				tagArrayParams[f] = vs
 			}
 		}
 

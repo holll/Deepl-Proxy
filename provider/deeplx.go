@@ -15,9 +15,13 @@ func (d *DeepLX) SupportsUsage() bool { return false }
 
 // deepLXRequest DeepLX 上游请求体
 type deepLXRequest struct {
-	Text       string `json:"text"`
-	SourceLang string `json:"source_lang,omitempty"`
-	TargetLang string `json:"target_lang"`
+	Text             string   `json:"text"`
+	SourceLang       string   `json:"source_lang,omitempty"`
+	TargetLang       string   `json:"target_lang"`
+	TagHandling      string   `json:"tag_handling,omitempty"`
+	NonSplittingTags []string `json:"non_splitting_tags,omitempty"`
+	SplittingTags    []string `json:"splitting_tags,omitempty"`
+	IgnoreTags       []string `json:"ignore_tags,omitempty"`
 }
 
 // deepLXResponse DeepLX 上游响应体
@@ -42,9 +46,13 @@ func (d *DeepLX) Translate(endpoint, authKey string, req *TranslateRequest) (*Tr
 	}
 
 	dlxReq := deepLXRequest{
-		Text:       text,
-		SourceLang: req.SourceLang,
-		TargetLang: strings.ToUpper(req.TargetLang),
+		Text:             text,
+		SourceLang:       req.SourceLang,
+		TargetLang:       strings.ToUpper(req.TargetLang),
+		TagHandling:      req.TagHandling,
+		NonSplittingTags: req.NonSplittingTags,
+		SplittingTags:    req.SplittingTags,
+		IgnoreTags:       req.IgnoreTags,
 	}
 	jsonBody, err := json.Marshal(dlxReq)
 	if err != nil {

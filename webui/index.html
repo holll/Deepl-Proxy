@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
   <title>Deepl Proxy - Admin</title>
   <link rel="icon" type="image/svg+xml" href="/webui/favicon.svg" sizes="any">
   <link rel="icon" type="image/png" sizes="16x16" href="/webui/favicon_16.png">
@@ -12,15 +13,16 @@
   <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
+  <a href="#app" class="skip-link">跳到主内容</a>
 
 <div id="login" class="login-overlay" hidden>
-  <div class="login-box">
+  <form class="login-box" id="loginForm">
     <h2>管理员验证</h2>
-    <p>输入 <code>ADMIN_TOKEN</code> 登录</p>
-    <input id="tokenInput" type="password" placeholder="ADMIN_TOKEN" autofocus />
+    <p>输入 <code translate="no">ADMIN_TOKEN</code> 登录</p>
+    <input id="tokenInput" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" name="admin_token" spellcheck="false" aria-label="管理员令牌" autofocus />
     <div id="loginError" class="msg-error"></div>
-    <div class="login-actions"><button id="loginBtn" class="btn-primary">验证并进入</button></div>
-  </div>
+    <div class="login-actions"><button id="loginBtn" type="submit" class="btn-primary">验证并进入</button></div>
+  </form>
 </div>
 
 <main id="app" hidden>
@@ -36,15 +38,15 @@
     </div>
   </header>
 
-  <div id="statusBar" class="status-bar"></div>
+  <div id="statusBar" class="status-bar" role="status" aria-live="polite"></div>
 
   <section class="card">
     <h3>新增 Key</h3>
     <div class="form-grid">
-      <div class="field"><label for="fName">Name</label><input id="fName" placeholder="my-key" /></div>
-      <div class="field"><label for="fAuth">Auth Key</label><input id="fAuth" placeholder="DeepL API key（deeplx 可留空）" /></div>
-      <div class="field"><label for="fEndpoint">Endpoint</label><input id="fEndpoint" placeholder="https://api.deepl-pro.com" /></div>
-      <div class="field"><label for="fProvider">Provider</label><select id="fProvider"><option value="deepl">deepl</option><option value="deeplx">deeplx</option></select></div>
+      <div class="field"><label for="fName">Name</label><input id="fName" placeholder="my-key…" autocomplete="off" spellcheck="false" /></div>
+      <div class="field"><label for="fAuth">Auth Key</label><input id="fAuth" placeholder="DeepL API key（deeplx 可留空）" autocomplete="off" spellcheck="false" /></div>
+      <div class="field"><label for="fEndpoint">Endpoint</label><input id="fEndpoint" placeholder="https://api.deepl-pro.com" autocomplete="off" spellcheck="false" /></div>
+      <div class="field"><label for="fProvider">Provider</label><select id="fProvider" name="provider"><option value="deepl">deepl</option><option value="deeplx">deeplx</option></select></div>
       <div class="field field-action"><label>&nbsp;</label><button id="addBtn" class="btn-primary">新增</button></div>
     </div>
   </section>

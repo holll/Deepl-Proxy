@@ -32,6 +32,12 @@ type TranslateRequest struct {
 	FormParams string // form-urlencoded body string (DeepL format)
 	JSONBody   []byte // JSON body (DeepLX format)
 	Extra      map[string]string
+
+	// Tag handling（用于 DeepLX 提供商，DeepL 走 FormParams 已包含）
+	TagHandling      string
+	NonSplittingTags []string
+	SplittingTags    []string
+	IgnoreTags       []string
 }
 
 // Provider 上游翻译服务接口

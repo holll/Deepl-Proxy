@@ -1,5 +1,6 @@
 var $ = {
-  login:   id('login'),    token:   id('tokenInput'), loginErr: id('loginError'), loginBtn: id('loginBtn'),
+  login:   id('login'),    token:   id('tokenInput'), loginErr: id('loginError'),
+  loginForm: id('loginForm'),
   app:     id('app'),      status:  id('statusBar'),
   fName:   id('fName'),    fAuth:   id('fAuth'),      fEndpoint: id('fEndpoint'), fProvider: id('fProvider'), addBtn: id('addBtn'),
   reload:  id('reloadBtn'),refresh: id('refreshUsageBtn'), logout: id('logoutBtn'),
@@ -100,11 +101,11 @@ function row(k){
 
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
-async function loadKeys(){
-  status('加载中...');
+async function loadKeys(silent){
+  if (!silent) status('加载中...');
   var data = await api('/admin/keys');
   $.tb.innerHTML = (data.keys||[]).map(row).join('') || '<tr><td colspan="9">暂无数据</td></tr>';
-  status('已刷新', true);
+  if (!silent) status('已刷新', true);
 }
 
 /* ---- Key CRUD ---- */
@@ -181,8 +182,8 @@ function cacheRow(c){
     '</tr>';
 }
 
-async function loadCache(){
-  status('缓存加载中...');
+async function loadCache(silent){
+  if (!silent) status('缓存加载中...');
   var q = '?limit='+cachePage.limit+'&offset='+cachePage.offset;
   try {
     var data = await api('/admin/cache'+q);
@@ -190,12 +191,12 @@ async function loadCache(){
     $.cacheCount.textContent = '('+data.total+' 条)';
     cachePage.total = data.total;
     renderCachePager();
-    status('', null);
-  } catch(e){ status(e.message, false); }
+    if (!silent) status('', null);
+  } catch(e){ if (!silent) status(e.message, false); else throw e; }
 }
 
 async function delCache(key){
-  if (!confirm('删除缓存条目 '+key.slice(0,40)+'...?')) return;
+  if (!confirm('删除缓存条目 '+key.slice(0,40)+'…?')) return;
   await api('/admin/cache?key='+encodeURIComponent(key), {method:'DELETE'});
   status('已删除', true);
   await loadCache();
@@ -226,10 +227,15 @@ function renderCachePager(){
 }
 
 /* ---- 事件 ---- */
-$.loginBtn.addEventListener('click', function(){ login().catch(function(e){ $.loginErr.textContent = e.message; }); });
-$.token.addEventListener('keydown', function(e){ if (e.key==='Enter') login().catch(function(e){ $.loginErr.textContent = e.message; }); });
+$.loginForm.addEventListener('submit', function(e){ e.preventDefault(); login().catch(function(e){ $.loginErr.textContent = e.message; }); });
 $.addBtn.addEventListener('click', function(){ addKey().catch(function(e){ status(e.message, false); }); });
-$.reload.addEventListener('click', function(){ loadKeys().catch(function(e){ status(e.message, false); }); });
+$.reload.addEventListener('click', function(){
+  status('加载中...');
+  Promise.all([
+    loadKeys(true),
+    loadCache(true)
+  ]).then(function(){ status('已刷新', true); }).catch(function(e){ status(e.message, false); });
+});
 $.refresh.addEventListener('click', function(){
   api('/admin/usage-refresh',{method:'POST'}).then(function(){ return loadKeys(); }).catch(function(e){ status(e.message, false); });
 });

@@ -9,6 +9,7 @@
   --green:   #22c55e;
   --yellow:  #eab308;
   --orange:  #f97316;
+  color-scheme: dark;
 }
 
 *{box-sizing:border-box;margin:0;padding:0}
@@ -19,6 +20,27 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   line-height: 1.5;
   min-height: 100vh;
+  touch-action: manipulation;
+}
+
+/* ---- Skip Link ---- */
+.skip-link {
+  position: absolute;
+  top: -100%;
+  left: 0;
+  padding: 8px 16px;
+  background: var(--primary);
+  color: #fff;
+  z-index: 999;
+  font-size: 14px;
+  text-decoration: none;
+  border-radius: 0 0 8px 0;
+  transition: top 0.15s;
+}
+.skip-link:focus-visible {
+  top: 0;
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 /* ---- 登录 ---- */
@@ -27,6 +49,7 @@ body {
   background: rgba(5,10,20,.8);
   display: flex; align-items: center; justify-content: center;
   z-index: 100;
+  overscroll-behavior: contain;
 }
 .login-box {
   width: 100%; max-width: 400px;
@@ -45,9 +68,12 @@ body {
   border-radius: 8px;
   color: var(--text);
   font-size: 15px;
-  outline: none;
 }
-.login-box input:focus { border-color: var(--primary); }
+.login-box input:focus-visible {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
 .login-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 
 /* ---- 主布局 ---- */
@@ -64,7 +90,7 @@ body {
   margin-bottom: 12px;
   flex-wrap: wrap;
 }
-.topbar h1 { font-size: 28px; margin: 0; }
+.topbar h1 { font-size: 28px; margin: 0; text-wrap: balance; }
 .topbar-hint { color: var(--muted); font-size: 13px; }
 .topbar-actions { display: flex; gap: 8px; }
 
@@ -74,7 +100,9 @@ body {
   padding: 6px 0;
   color: var(--muted);
   font-size: 13px;
-  transition: color .2s;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .status-bar { transition: color .2s; }
 }
 .status-bar.ok  { color: var(--green); }
 .status-bar.err { color: var(--danger); }
@@ -105,12 +133,18 @@ body {
   border-radius: 8px;
   color: var(--text);
   font-size: 14px;
-  outline: none;
 }
-.field input:focus, .field select:focus { border-color: var(--primary); }
+.field input:focus-visible, .field select:focus-visible {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
 .field-action { justify-content: flex-end; }
 
 /* ---- 按钮 ---- */
+@media (prefers-reduced-motion: no-preference) {
+  button { transition: background .15s; }
+}
 button {
   padding: 10px 16px;
   border-radius: 8px;
@@ -120,9 +154,12 @@ button {
   cursor: pointer;
   font-size: 14px;
   white-space: nowrap;
-  transition: background .15s;
 }
 button:hover { background: #1a2438; }
+button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
 .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn-primary:hover { background: #2563eb; }
 .btn-danger  { border-color: var(--danger); color: var(--danger); }
@@ -199,6 +236,7 @@ td select {
 @media (max-width: 900px) {
   .form-grid { grid-template-columns: 1fr 1fr; }
   .topbar { flex-direction: column; }
+  .topbar h1 { font-size: 22px; }
   table { font-size: 13px; }
   th, td { padding: 8px; }
 }
