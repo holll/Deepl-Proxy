@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"deepl-proxy/models"
@@ -14,26 +15,43 @@ import (
 )
 
 // Init opens the SQLite database, ensures directories exist, and runs migrations.
-func Init(dbPath string) *sql.DB {
+// Returns separate write (MaxOpenConns=1) and read (MaxOpenConns=4) connections.
+// WAL mode allows concurrent readers alongside a single writer.
+func Init(dbPath string) (writeDB *sql.DB, readDB *sql.DB) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Fatalf("create db directory: %v", err)
 	}
 
 	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		log.Fatalf("open sqlite: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		log.Fatalf("ping sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
 
-	migrate(db)
-	return db
+	// Write connection — single writer, serialized
+	wdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		log.Fatalf("open sqlite write: %v", err)
+	}
+	if err := wdb.Ping(); err != nil {
+		log.Fatalf("ping sqlite write: %v", err)
+	}
+	wdb.SetMaxOpenConns(1)
+	wdb.SetMaxIdleConns(1)
+	wdb.SetConnMaxLifetime(0)
+
+	migrate(wdb)
+
+	// Read connection — multiple concurrent readers (WAL)
+	rdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		log.Fatalf("open sqlite read: %v", err)
+	}
+	if err := rdb.Ping(); err != nil {
+		log.Fatalf("ping sqlite read: %v", err)
+	}
+	rdb.SetMaxOpenConns(4)
+	rdb.SetMaxIdleConns(4)
+	rdb.SetConnMaxLifetime(0)
+
+	return wdb, rdb
 }
 
 func migrate(db *sql.DB) {
@@ -68,7 +86,9 @@ func migrate(db *sql.DB) {
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
-			log.Printf("migration warning: %v", err)
+			if !strings.Contains(err.Error(), "duplicate column") {
+				log.Printf("migration warning: %v", err)
+			}
 		}
 	}
 }
@@ -110,6 +130,15 @@ func DeleteKey(db *sql.DB, id int64) error {
 
 func GetActiveKeys(db *sql.DB) ([]models.DeeplKey, error) {
 	return queryKeys(db, "SELECT * FROM deepl_keys WHERE status='active' ORDER BY id ASC")
+}
+
+// ReactivateExpiredKeys 将已过禁用期的 key 恢复为 active 状态。
+func ReactivateExpiredKeys(db *sql.DB, now int64) error {
+	_, err := db.Exec(
+		"UPDATE deepl_keys SET status='active',disable_type=NULL,disabled_until=NULL,updated_at=? WHERE status='disabled' AND disabled_until IS NOT NULL AND disabled_until<=?",
+		now, now,
+	)
+	return err
 }
 
 func GetAllKeys(db *sql.DB) ([]models.DeeplKey, error) {
@@ -303,8 +332,6 @@ func UpdateUsageSnapshot(db *sql.DB, keyID int64, charCount, charLimit *int64, n
 
 func startOfNextMonthBeijing(now time.Time) time.Time {
 	offset := 8 * time.Hour
-	bj := now.In(time.FixedZone("CST", 8*60*60))
-	_ = bj
 	bjNow := now.Add(offset)
 	utcNext := time.Date(bjNow.Year(), bjNow.Month()+1, 1, 0, 0, 0, 0, time.UTC)
 	return utcNext.Add(-offset)

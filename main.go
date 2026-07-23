@@ -27,12 +27,16 @@ func main() {
 	cfg := config.Load()
 
 	// 初始化数据库
-	db := database.Init(cfg.Database.Path)
-	defer db.Close()
+	writeDB, readDB := database.Init(cfg.Database.Path)
+	defer writeDB.Close()
+	defer readDB.Close()
 
 	// 初始化服务
-	kr := service.NewKeyring(db)
-	cs := service.NewCacheService(db, cfg)
+	kr := service.NewKeyring(writeDB, readDB)
+	cs := service.NewCacheService(writeDB, readDB, cfg)
+
+	// 启动时查询所有 key 的用量
+	go kr.RefreshAllUsage()
 
 	// 定时缓存清理
 	go func() {

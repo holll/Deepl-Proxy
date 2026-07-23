@@ -71,10 +71,16 @@ func RequestLogger() gin.HandlerFunc {
 		cost := now.Sub(start).Truncate(time.Microsecond)
 		status := c.Writer.Status()
 
+		cacheStatus := c.Writer.Header().Get("X-Cache-Status")
+		cacheTag := ""
+		if cacheStatus != "" {
+			cacheTag = " | " + cacheStatus
+		}
+
 		fmt.Printf(
-			"%s | %s | %s %s | %s%d%s | %s%v%s | %s | %s\n",
-			now.Format("2006-01-02 15:04:05"), // 时间打印回来
-			reqID,
+			"%s | %s | %s %s | %s%d%s | %s%v%s | %s%s\n",
+			now.Format("15:04:05"),
+			reqID[:8],
 			c.Request.Method,
 			c.Request.URL.Path,
 
@@ -87,7 +93,7 @@ func RequestLogger() gin.HandlerFunc {
 			reset,
 
 			c.ClientIP(),
-			c.Request.UserAgent(),
+			cacheTag,
 		)
 	}
 }

@@ -31,7 +31,7 @@ type DatabaseConfig struct {
 }
 
 type CacheConfig struct {
-	// TTL 改为“天”，避免歧义
+	// TTL 改为"天"，避免歧义
 	TTLDays int `yaml:"ttl_days"`
 
 	CleanupInterval  int `yaml:"cleanup_interval"`   // 秒

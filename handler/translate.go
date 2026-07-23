@@ -301,7 +301,7 @@ func normalizeFormIdentity(form url.Values) *models.CacheIdentity {
 	return &models.CacheIdentity{
 		Text:               form["text"],
 		TargetLang:         strings.ToUpper(form.Get("target_lang")),
-		SourceLang:         upperOrEmpty(form.Get("source_lang")),
+		SourceLang:         upperOrNull(form.Get("source_lang")),
 		Formality:          form.Get("formality"),
 		GlossaryID:         form.Get("glossary_id"),
 		Context:            form.Get("context"),
@@ -412,13 +412,6 @@ func getStrArr(m map[string]any, key string) []string {
 }
 
 func upperOrNull(s string) string {
-	if s == "" {
-		return ""
-	}
-	return strings.ToUpper(s)
-}
-
-func upperOrEmpty(s string) string {
 	if s == "" {
 		return ""
 	}

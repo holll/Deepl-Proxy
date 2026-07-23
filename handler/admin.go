@@ -89,7 +89,7 @@ func handleAdminKeyCreate(kr *service.Keyring) gin.HandlerFunc {
 			body.Provider = "deepl"
 		}
 
-		id, err := database.InsertKey(kr.DB(), body.Name, body.AuthKey, body.Endpoint, body.Provider)
+		id, err := kr.AddKey(body.Name, body.AuthKey, body.Endpoint, body.Provider)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -113,8 +113,8 @@ func handleAdminKeyUpdate(kr *service.Keyring) gin.HandlerFunc {
 			return
 		}
 
-		err = database.UpdateKey(
-			kr.DB(), id,
+		err = kr.UpdateKeyByID(
+			id,
 			nullableStrBody(body, "name"),
 			nullableStrBody(body, "auth_key"),
 			nullableStrBody(body, "endpoint"),
@@ -137,7 +137,7 @@ func handleAdminKeyDelete(kr *service.Keyring) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id"})
 			return
 		}
-		if err := database.DeleteKey(kr.DB(), id); err != nil {
+		if err := kr.DeleteKeyByID(id); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -215,7 +215,7 @@ func handleCacheDelete(kr *service.Keyring) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "key query param required"})
 			return
 		}
-		if err := database.DeleteCacheByKey(kr.DB(), key); err != nil {
+		if err := database.DeleteCacheByKey(kr.WriteDB(), key); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}

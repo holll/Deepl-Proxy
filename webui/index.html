@@ -45,7 +45,15 @@
     <div class="form-grid">
       <div class="field"><label for="fName">Name</label><input id="fName" placeholder="my-key…" autocomplete="off" spellcheck="false" /></div>
       <div class="field"><label for="fAuth">Auth Key</label><input id="fAuth" placeholder="DeepL API key（deeplx 可留空）" autocomplete="off" spellcheck="false" /></div>
-      <div class="field"><label for="fEndpoint">Endpoint</label><input id="fEndpoint" placeholder="https://api.deepl-pro.com" autocomplete="off" spellcheck="false" /></div>
+      <div class="field"><label for="fEndpoint">Endpoint</label>
+        <select id="fEndpointSelect">
+          <option value="https://api.deepl-pro.com">api.deepl-pro.com（第三方）</option>
+          <option value="https://api-free.deepl.com">api-free.deepl.com（官方免费）</option>
+          <option value="https://api.deepl.com">api.deepl.com（官方付费）</option>
+          <option value="__custom__">自定义…</option>
+        </select>
+        <input id="fEndpoint" placeholder="https://..." autocomplete="off" spellcheck="false" hidden />
+      </div>
       <div class="field"><label for="fProvider">Provider</label><select id="fProvider" name="provider"><option value="deepl">deepl</option><option value="deeplx">deeplx</option></select></div>
       <div class="field field-action"><label>&nbsp;</label><button id="addBtn" class="btn-primary">新增</button></div>
     </div>

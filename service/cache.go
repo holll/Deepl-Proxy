@@ -17,12 +17,13 @@ import (
 )
 
 type CacheService struct {
-	db  *sql.DB
-	cfg *config.Config
+	writeDB *sql.DB
+	readDB  *sql.DB
+	cfg     *config.Config
 }
 
-func NewCacheService(db *sql.DB, cfg *config.Config) *CacheService {
-	return &CacheService{db: db, cfg: cfg}
+func NewCacheService(writeDB, readDB *sql.DB, cfg *config.Config) *CacheService {
+	return &CacheService{writeDB: writeDB, readDB: readDB, cfg: cfg}
 }
 
 type CachedHit struct {
@@ -32,11 +33,10 @@ type CachedHit struct {
 
 //
 // ========================
-// TTL（统一 duration）
+// TTL
 // ========================
 //
 
-// TTL 返回缓存 TTL（time.Duration）
 func (cs *CacheService) TTL() time.Duration {
 	return cs.cfg.Cache.TTLDuration()
 }
@@ -58,39 +58,32 @@ func BuildCacheKey(identity *models.CacheIdentity) (string, error) {
 
 //
 // ========================
-// GET（避免写放大优化）
+// GET
 // ========================
 //
 
 func (cs *CacheService) Get(cacheKey string) (*CachedHit, error) {
 	now := time.Now().UnixMilli()
 
-	c, err := database.GetCacheByKey(cs.db, cacheKey, now)
+	c, err := database.GetCacheByKey(cs.readDB, cacheKey, now)
 	if err != nil || c == nil {
 		return nil, err
 	}
 
 	ttl := cs.TTL().Milliseconds()
 
-	// -------------------------
-	// ✔ sliding TTL（优化版）
-	// 只有在“快过期时”才续期
-	// -------------------------
+	// sliding TTL: only renew when < 50% TTL remains
 	if ttl > 0 {
 		remaining := c.ExpiresAt - now
-
-		// 仅在剩余 < 50% TTL 时续期（减少写DB）
 		if remaining < ttl/2 {
 			newExp := now + ttl
-			if err := database.UpdateCacheExpiry(cs.db, cacheKey, newExp); err != nil {
+			if err := database.UpdateCacheExpiry(cs.writeDB, cacheKey, newExp); err != nil {
 				log.Printf("[cache] update expiry failed: %v", err)
 			}
 		}
 	}
 
-	// -------------------------
-	// headers restore
-	// -------------------------
+	// restore headers
 	headers := http.Header{}
 	if c.HeadersJSON != "" {
 		var parsed map[string][]string
@@ -102,15 +95,11 @@ func (cs *CacheService) Get(cacheKey string) (*CachedHit, error) {
 			}
 		}
 	}
-
 	if headers.Get("Content-Type") == "" {
 		headers.Set("Content-Type", "application/json; charset=utf-8")
 	}
 
-	return &CachedHit{
-		Body:    c.Body,
-		Headers: headers,
-	}, nil
+	return &CachedHit{Body: c.Body, Headers: headers}, nil
 }
 
 //
@@ -134,14 +123,13 @@ func (cs *CacheService) Put(cacheKey string, body string, upstreamHeaders http.H
 
 	headersJSON, _ := json.Marshal(mapFromHeader(clean))
 
-	err := database.UpsertCache(cs.db, &models.TranslateCache{
+	err := database.UpsertCache(cs.writeDB, &models.TranslateCache{
 		CacheKey:    cacheKey,
 		Body:        body,
 		HeadersJSON: string(headersJSON),
 		CreatedAt:   now,
 		ExpiresAt:   expiresAt,
 	})
-
 	if err != nil {
 		log.Printf("[cache] put failed: %v", err)
 	}
@@ -167,13 +155,13 @@ func (cs *CacheService) cacheControlHeader() string {
 
 //
 // ========================
-// cleanup
+// Cleanup
 // ========================
 //
 
 func (cs *CacheService) CleanExpired() {
 	if err := database.CleanExpiredCache(
-		cs.db,
+		cs.writeDB,
 		cs.cfg.Cache.CleanupBatchSize,
 		cs.cfg.Cache.CleanupMaxRounds,
 	); err != nil {
@@ -183,7 +171,7 @@ func (cs *CacheService) CleanExpired() {
 
 //
 // ========================
-// types
+// Helpers
 // ========================
 //
 
@@ -194,22 +182,15 @@ func IsNoCacheRequest(r *http.Request) bool {
 
 func sanitizeCacheHeaders(h http.Header) http.Header {
 	clean := make(http.Header)
-
 	for k, vs := range h {
 		kl := strings.ToLower(k)
-
-		if kl == "x-upstream-key-name" {
+		if kl == "x-upstream-key-name" || kl == "set-cookie" || kl == "authorization" {
 			continue
 		}
-		if kl == "set-cookie" || kl == "authorization" {
-			continue
-		}
-
 		for _, v := range vs {
 			clean.Add(k, v)
 		}
 	}
-
 	return clean
 }
 

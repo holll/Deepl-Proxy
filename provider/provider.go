@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // TranslateResult 上游翻译结果
@@ -84,7 +85,7 @@ func parseUsageResponse(body string) (*UsageInfo, error) {
 // ClassifyError 根据状态码和响应体分类错误类型
 func ClassifyError(statusCode int, body, siteType string) string {
 	content := strings.ToLower(body)
-	if statusCode == 456 || strings.Contains(content, "quota") || strings.Contains(content, "limit") {
+	if statusCode == 456 || strings.Contains(content, "quota exceeded") || strings.Contains(content, "character quota") {
 		if siteType == "deepl_pro" || siteType == "deeplx" {
 			return "permanent"
 		}
@@ -97,6 +98,16 @@ func ClassifyError(statusCode int, body, siteType string) string {
 		return "permanent"
 	}
 	return "none"
+}
+
+// httpClient is the shared HTTP client for all provider calls.
+// Timeout prevents goroutine leaks on slow upstream responses.
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	},
 }
 
 // doPost helper
@@ -114,7 +125,7 @@ func doPost(urlStr string, authHeader, contentType, body string, headers map[str
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return http.DefaultClient.Do(req)
+	return httpClient.Do(req)
 }
 
 // doGet helper
@@ -126,7 +137,7 @@ func doGet(urlStr string, authHeader string) (*http.Response, error) {
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
-	return http.DefaultClient.Do(req)
+	return httpClient.Do(req)
 }
 
 // deepLCompatTranslate 将翻译结果转为 DeepL 兼容格式
@@ -147,7 +158,7 @@ func deepLCompatTranslate(text, sourceLang string) string {
 	return string(b)
 }
 
-// buildDeepLForm 构建 DeepL form-urlencoded body
+// BuildDeepLForm  构建 DeepL form-urlencoded body
 func BuildDeepLForm(texts []string, targetLang, sourceLang string, extra url.Values) string {
 	form := url.Values{}
 	for _, t := range texts {
@@ -174,14 +185,3 @@ func readBody(resp *http.Response) (string, error) {
 	}
 	return string(b), nil
 }
-
-// truncateStr helper
-func truncateStr(s string, max int) string {
-	if len(s) > max {
-		return s[:max]
-	}
-	return s
-}
-
-// int64Ptr helper
-func int64Ptr(v int64) *int64 { return &v }

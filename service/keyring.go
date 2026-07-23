@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"deepl-proxy/database"
@@ -14,76 +16,180 @@ import (
 
 // Keyring 管理上游 key 的轮询、熔断和用量快照。
 type Keyring struct {
-	db         *sql.DB
+	writeDB    *sql.DB
+	readDB     *sql.DB
 	sampleRate float64
+
+	// in-memory key cache
+	mu         sync.RWMutex
+	cachedKeys []models.DeeplKey
+	dirty      bool
+	cachedAt   int64 // UnixMilli — cache 创建时间，用于定期过期
+
+	// round-robin counter
+	counter atomic.Int64
 }
 
-func NewKeyring(db *sql.DB) *Keyring {
+func NewKeyring(writeDB, readDB *sql.DB) *Keyring {
 	return &Keyring{
-		db:         db,
+		writeDB:    writeDB,
+		readDB:     readDB,
 		sampleRate: 0.05,
+		dirty:      true,
 	}
 }
 
-// DB returns the underlying database connection.
-func (kr *Keyring) DB() *sql.DB { return kr.db }
+// DB returns the read connection (for read-only admin queries).
+func (kr *Keyring) DB() *sql.DB { return kr.readDB }
 
-// SetSampleRate 设置用量采样率 (0.0-1.0)
-func (kr *Keyring) SetSampleRate(rate float64) {
-	if rate < 0 {
-		rate = 0
-	}
-	if rate > 1 {
-		rate = 1
-	}
-	kr.sampleRate = rate
+// WriteDB returns the write connection (for admin write operations).
+func (kr *Keyring) WriteDB() *sql.DB { return kr.writeDB }
+
+// invalidateKeyCache marks the in-memory key list as stale.
+func (kr *Keyring) invalidateKeyCache() {
+	kr.mu.Lock()
+	kr.dirty = true
+	kr.mu.Unlock()
 }
 
-// GetActiveKeys 获取所有 active 状态的 key
+// keyCacheTTL 内存 key 缓存最大存活时间，确保临时禁用到期后能被发现。
+const keyCacheTTL int64 = 30 * 1000 // 30 秒
+
+// GetActiveKeys returns active keys from memory cache, reloading from DB when dirty or cache expired.
 func (kr *Keyring) GetActiveKeys() ([]models.DeeplKey, error) {
-	keys, err := database.GetActiveKeys(kr.db)
+	now := time.Now().UnixMilli()
+
+	kr.mu.RLock()
+	if !kr.dirty && (now-kr.cachedAt) < keyCacheTTL {
+		keys := make([]models.DeeplKey, len(kr.cachedKeys))
+		copy(keys, kr.cachedKeys)
+		kr.mu.RUnlock()
+		return keys, nil
+	}
+	kr.mu.RUnlock()
+
+	// upgrade to write lock for reload
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+
+	// double-check
+	if !kr.dirty && (now-kr.cachedAt) < keyCacheTTL {
+		keys := make([]models.DeeplKey, len(kr.cachedKeys))
+		copy(keys, kr.cachedKeys)
+		return keys, nil
+	}
+
+	// 先恢复已过禁用期的 key
+	if err := database.ReactivateExpiredKeys(kr.writeDB, now); err != nil {
+		log.Printf("keyring: reactivate expired keys failed: %v", err)
+	}
+
+	keys, err := database.GetActiveKeys(kr.readDB)
 	if err != nil {
 		return nil, err
 	}
 
-	// 过滤过期的临时/月度禁用
-	now := time.Now().UnixMilli()
 	var active []models.DeeplKey
 	for _, k := range keys {
-		if k.DisabledUntil != nil && *k.DisabledUntil > 0 && *k.DisabledUntil <= now {
-			// 恢复为 active
-			if err := database.UpdateKey(kr.db, k.ID, nil, nil, nil, nil, strPtr("active")); err != nil {
-				log.Printf("keyring: reactivate key %d failed: %v", k.ID, err)
-				continue
-			}
-			k.Status = "active"
-			k.DisabledUntil = nil
-			k.DisableType = nil
-		}
 		if k.Status == "active" {
 			active = append(active, k)
 		}
 	}
-	return active, nil
+
+	kr.cachedKeys = active
+	kr.dirty = false
+	kr.cachedAt = now
+
+	result := make([]models.DeeplKey, len(active))
+	copy(result, active)
+	return result, nil
+}
+
+// --- Key CRUD wrappers (invalidate cache on write) ---
+
+func (kr *Keyring) AddKey(name, authKey, endpoint, prov string) (int64, error) {
+	id, err := database.InsertKey(kr.writeDB, name, authKey, endpoint, prov)
+	if err == nil {
+		kr.invalidateKeyCache()
+		go kr.fetchAndSaveUsage(id, authKey, endpoint, prov)
+	}
+	return id, err
+}
+
+// fetchAndSaveUsage 查询指定 key 的用量并保存到数据库。
+func (kr *Keyring) fetchAndSaveUsage(keyID int64, authKey, endpoint, prov string) {
+	p := provider.DetectProvider(prov)
+	if !p.SupportsUsage() {
+		return
+	}
+	info, err := p.FetchUsage(endpoint, authKey)
+	if err != nil {
+		log.Printf("keyring: fetch usage for key %d failed: %v", keyID, err)
+		return
+	}
+	if info.Ok && (info.CharacterCount != nil || info.CharacterLimit != nil) {
+		now := time.Now().UnixMilli()
+		if err := database.UpdateUsageSnapshot(kr.writeDB, keyID, info.CharacterCount, info.CharacterLimit, now); err != nil {
+			log.Printf("keyring: save usage for key %d failed: %v", keyID, err)
+			return
+		}
+		kr.invalidateKeyCache()
+	}
+}
+
+// RefreshAllUsage 查询所有 key（含未启用）的用量，用于启动时初始化。
+func (kr *Keyring) RefreshAllUsage() {
+	keys, err := database.GetAllKeys(kr.readDB)
+	if err != nil {
+		log.Printf("keyring: refresh all usage failed: %v", err)
+		return
+	}
+	for _, k := range keys {
+		kr.fetchAndSaveUsage(k.ID, k.AuthKey, k.Endpoint, k.Provider)
+	}
+	log.Printf("keyring: refreshed usage for %d key(s)", len(keys))
+}
+
+func (kr *Keyring) UpdateKeyByID(id int64, name, authKey, endpoint, prov, status *string) error {
+	err := database.UpdateKey(kr.writeDB, id, name, authKey, endpoint, prov, status)
+	if err == nil {
+		kr.invalidateKeyCache()
+	}
+	return err
+}
+
+func (kr *Keyring) DeleteKeyByID(id int64) error {
+	err := database.DeleteKey(kr.writeDB, id)
+	if err == nil {
+		kr.invalidateKeyCache()
+	}
+	return err
 }
 
 // Translate 轮询 active key 进行翻译，失败时自动熔断。
+// Uses round-robin starting index to distribute load evenly across keys.
 func (kr *Keyring) Translate(keys []models.DeeplKey, req *provider.TranslateRequest) (*provider.TranslateResult, *models.DeeplKey, *FailureInfo, error) {
+	n := len(keys)
+	if n == 0 {
+		return nil, nil, nil, fmt.Errorf("no keys")
+	}
+
+	start := int(kr.counter.Add(1)-1) % n
+
 	var lastFailure *FailureInfo
 
-	for _, k := range keys {
+	for i := 0; i < n; i++ {
+		k := keys[(start+i)%n]
 		prov := provider.DetectProvider(k.Provider)
 		result, err := prov.Translate(k.Endpoint, k.AuthKey, req)
 
 		if err == nil && result.StatusCode < 500 {
-			// 成功
 			if kr.shouldSampleUsage() && prov.SupportsUsage() {
-				go kr.sampleUsage(k)
+				go kr.fetchAndSaveUsage(k.ID, k.AuthKey, k.Endpoint, k.Provider)
 			}
 			return result, &k, nil, nil
 		}
 
-		// 失败 -> 分类并熔断
 		errType := "network_error"
 		statusCode := 0
 		body := ""
@@ -98,8 +204,14 @@ func (kr *Keyring) Translate(keys []models.DeeplKey, req *provider.TranslateRequ
 		}
 
 		if err == nil {
-			// HTTP 错误
 			errType = provider.ClassifyError(statusCode, body, siteType)
+		}
+
+		// 打印上游错误详情
+		if err != nil {
+			log.Printf("keyring: key %s upstream error: %v", k.Name, err)
+		} else {
+			log.Printf("keyring: key %s upstream %d [%s]: %s", k.Name, statusCode, errType, truncateStr(body, 200))
 		}
 
 		kr.applyDisable(k, errType, statusCode, body, err)
@@ -136,37 +248,21 @@ func (kr *Keyring) applyDisable(k models.DeeplKey, errType string, statusCode in
 
 	switch errType {
 	case "monthly":
-		_ = database.DisableKeyMonthly(kr.db, k.ID, code, msg, now)
+		_ = database.DisableKeyMonthly(kr.writeDB, k.ID, code, msg, now)
 	case "temporary":
-		_ = database.DisableKeyTemporary(kr.db, k.ID, code, msg, 5*60*1000, now)
+		_ = database.DisableKeyTemporary(kr.writeDB, k.ID, code, msg, 5*60*1000, now)
 	case "permanent":
-		_ = database.DisableKeyPermanent(kr.db, k.ID, code, msg, now)
+		_ = database.DisableKeyPermanent(kr.writeDB, k.ID, code, msg, now)
 	default:
-		// network_error
-		_ = database.DisableKeyTemporary(kr.db, k.ID, code, msg, 60*1000, now)
+		// network_error（超时等）：不禁用，仅记录错误信息
+		return
 	}
+
+	kr.invalidateKeyCache()
 }
 
 func (kr *Keyring) shouldSampleUsage() bool {
 	return rand.Float64() < kr.sampleRate
-}
-
-func (kr *Keyring) sampleUsage(k models.DeeplKey) {
-	prov := provider.DetectProvider(k.Provider)
-	if !prov.SupportsUsage() {
-		return
-	}
-	info, err := prov.FetchUsage(k.Endpoint, k.AuthKey)
-	if err != nil {
-		log.Printf("keyring: sample usage for key %s failed: %v", k.Name, err)
-		return
-	}
-	if info.Ok && (info.CharacterCount != nil || info.CharacterLimit != nil) {
-		now := time.Now().UnixMilli()
-		if err := database.UpdateUsageSnapshot(kr.db, k.ID, info.CharacterCount, info.CharacterLimit, now); err != nil {
-			log.Printf("keyring: update usage snapshot for key %s failed: %v", k.Name, err)
-		}
-	}
 }
 
 // RefreshUsage 手动刷新所有 active key 的用量
@@ -198,7 +294,7 @@ func (kr *Keyring) RefreshUsage() []UsageRefreshResult {
 		}
 		if info.Ok && (info.CharacterCount != nil || info.CharacterLimit != nil) {
 			now := time.Now().UnixMilli()
-			if dbErr := database.UpdateUsageSnapshot(kr.db, k.ID, info.CharacterCount, info.CharacterLimit, now); dbErr != nil {
+			if dbErr := database.UpdateUsageSnapshot(kr.writeDB, k.ID, info.CharacterCount, info.CharacterLimit, now); dbErr != nil {
 				results = append(results, UsageRefreshResult{KeyName: k.Name, Ok: false, Error: dbErr.Error()})
 				continue
 			}

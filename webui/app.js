@@ -2,7 +2,7 @@ var $ = {
   login:   id('login'),    token:   id('tokenInput'), loginErr: id('loginError'),
   loginForm: id('loginForm'),
   app:     id('app'),      status:  id('statusBar'),
-  fName:   id('fName'),    fAuth:   id('fAuth'),      fEndpoint: id('fEndpoint'), fProvider: id('fProvider'), addBtn: id('addBtn'),
+  fName:   id('fName'),    fAuth:   id('fAuth'),      fEndpoint: id('fEndpoint'), fEndpointSelect: id('fEndpointSelect'), fProvider: id('fProvider'), addBtn: id('addBtn'),
   reload:  id('reloadBtn'),refresh: id('refreshUsageBtn'), logout: id('logoutBtn'),
   tb:      id('tb'),
   cacheTb: id('cacheTb'), cachePager: id('cachePager'), cacheCount: id('cacheCount')
@@ -109,16 +109,23 @@ async function loadKeys(silent){
 }
 
 /* ---- Key CRUD ---- */
+function getEndpoint(){
+  var sel = $.fEndpointSelect.value;
+  return sel === '__custom__' ? $.fEndpoint.value.trim() : sel;
+}
+
 async function addKey(){
+  var endpoint = getEndpoint();
   var payload = {
     name:     $.fName.value.trim(),
     auth_key: $.fAuth.value.trim(),
-    endpoint: $.fEndpoint.value.trim(),
+    endpoint: endpoint,
     provider: $.fProvider.value
   };
   if (!payload.name || !payload.endpoint){ status('Name 和 Endpoint 必填', false); return; }
   await api('/admin/keys',{method:'POST',body:JSON.stringify(payload)});
-  $.fName.value=''; $.fAuth.value=''; $.fEndpoint.value='';
+  $.fName.value=''; $.fAuth.value=''; $.fEndpoint.value=''; $.fEndpointSelect.value = $.fEndpointSelect.options[0].value;
+  $.fEndpoint.hidden = true;
   status('新增成功', true);
   await loadKeys();
 }
@@ -228,6 +235,11 @@ function renderCachePager(){
 
 /* ---- 事件 ---- */
 $.loginForm.addEventListener('submit', function(e){ e.preventDefault(); login().catch(function(e){ $.loginErr.textContent = e.message; }); });
+$.fEndpointSelect.addEventListener('change', function(){
+  var custom = this.value === '__custom__';
+  $.fEndpoint.hidden = !custom;
+  if (custom) $.fEndpoint.focus();
+});
 $.addBtn.addEventListener('click', function(){ addKey().catch(function(e){ status(e.message, false); }); });
 $.reload.addEventListener('click', function(){
   status('加载中...');
