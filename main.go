@@ -23,8 +23,17 @@ import (
 //go:embed webui/*
 var webuiEmbed embed.FS
 
+// 构建时通过 -ldflags "-X main.Version=... -X main.Commit=... -X main.BuildTime=..." 注入。
+var (
+	Version   = "dev"
+	Commit    = "dev"
+	BuildTime = "dev"
+)
+
 func main() {
 	cfg := config.Load()
+
+	log.Printf("DeepL Proxy %s (commit %s, built %s)", Version, Commit, BuildTime)
 
 	// 初始化数据库
 	writeDB, readDB := database.Init(cfg.Database.Path)

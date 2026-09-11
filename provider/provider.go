@@ -61,7 +61,8 @@ func DetectProvider(provider string) Provider {
 
 // DetectSiteType 根据 endpoint 判断 DeepL 站点类型
 func DetectSiteType(endpoint string) string {
-	if strings.Contains(strings.ToLower(endpoint), "api.deepl.com") {
+	e := strings.ToLower(endpoint)
+	if strings.Contains(e, "api.deepl.com") || strings.Contains(e, "api-free.deepl.com") {
 		return "official"
 	}
 	return "deepl_pro"

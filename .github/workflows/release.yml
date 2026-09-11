@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILDTIME="$(date -u +%Y-%m-%d_%H-%M-%S)"
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILDTIME}"
+
+          mkdir -p dist
+          printf 'Version=%s\nCommit=%s\nBuildTime=%s\n' "$VERSION" "$COMMIT" "$BUILDTIME" > dist/version.txt
+
+          for target in windows/amd64 linux/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+            out="dist/deepl-proxy_${os}_${arch}${ext}"
+            echo "::group::build ${out}"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -o "$out" -ldflags "$LDFLAGS" .
+            echo "::endgroup::"
+          done
+
+          ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

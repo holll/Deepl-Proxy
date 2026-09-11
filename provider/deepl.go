@@ -62,11 +62,20 @@ func (d *DeepL) FetchUsage(endpoint, authKey string) (*UsageInfo, error) {
 	}
 
 	info, parseErr := parseUsageResponse(body)
+	// 非 200 响应（如 403）body 通常不是 JSON，parseErr != nil 且 info == nil，
+	// 不能解引用 nil，直接返回空 UsageInfo 交给上层按状态码熔断。
+	if parseErr != nil || info == nil {
+		return &UsageInfo{
+			Ok:     resp.StatusCode == http.StatusOK,
+			Status: resp.StatusCode,
+			Text:   body,
+		}, parseErr
+	}
 	return &UsageInfo{
 		CharacterCount: info.CharacterCount,
 		CharacterLimit: info.CharacterLimit,
 		Ok:             resp.StatusCode == http.StatusOK,
 		Status:         resp.StatusCode,
 		Text:           body,
-	}, parseErr
+	}, nil
 }

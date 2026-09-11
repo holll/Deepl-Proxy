@@ -145,6 +145,11 @@ func GetAllKeys(db *sql.DB) ([]models.DeeplKey, error) {
 	return queryKeys(db, "SELECT id,name,endpoint,provider,status,disable_type,disabled_until,last_error_code,last_error_message,last_used_at,last_checked_at,character_count,character_limit,created_at,updated_at FROM deepl_keys ORDER BY id ASC")
 }
 
+// GetAllKeysWithAuth 返回所有 key（含 auth_key），仅供内部使用（如用量查询），不暴露给 admin API。
+func GetAllKeysWithAuth(db *sql.DB) ([]models.DeeplKey, error) {
+	return queryKeys(db, "SELECT * FROM deepl_keys ORDER BY id ASC")
+}
+
 func queryKeys(db *sql.DB, query string, args ...any) ([]models.DeeplKey, error) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -183,8 +188,9 @@ func queryKeys(db *sql.DB, query string, args ...any) ([]models.DeeplKey, error)
 			LastErrorMessage: nullableStr(m["last_error_message"]),
 			LastUsedAt:       nullableInt64(m["last_used_at"]),
 			LastCheckedAt:    nullableInt64(m["last_checked_at"]),
-			CharacterCount:   nullableInt64(m["character_count"]),
-			CharacterLimit:   nullableInt64(m["character_limit"]),
+			// 用量列 0 是合法值（免费额度 0 / 已用 0），不能当 NULL 丢弃
+			CharacterCount:   nullableInt64KeepZero(m["character_count"]),
+			CharacterLimit:   nullableInt64KeepZero(m["character_limit"]),
 			CreatedAt:        int64Val(m["created_at"]),
 			UpdatedAt:        int64Val(m["updated_at"]),
 		}
@@ -398,6 +404,21 @@ func nullableInt64(v any) *int64 {
 		if val == 0 {
 			return nil
 		}
+		return &val
+	}
+	return nil
+}
+
+// nullableInt64KeepZero 与 nullableInt64 相同，但 0 视为合法值而非 NULL。
+// 用于 character_count / character_limit：0 表示"已用 0"或"无限额度"，前端需显示。
+func nullableInt64KeepZero(v any) *int64 {
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case int64:
+		return &t
+	case float64:
+		val := int64(t)
 		return &val
 	}
 	return nil

@@ -116,30 +116,31 @@ func (kr *Keyring) AddKey(name, authKey, endpoint, prov string) (int64, error) {
 	return id, err
 }
 
-// fetchAndSaveUsage 查询指定 key 的用量并保存到数据库。
-func (kr *Keyring) fetchAndSaveUsage(keyID int64, authKey, endpoint, prov string) {
+// fetchAndSaveUsage 查询指定 key 的用量并保存到数据库，返回用量信息。
+func (kr *Keyring) fetchAndSaveUsage(keyID int64, authKey, endpoint, prov string) (*provider.UsageInfo, error) {
 	p := provider.DetectProvider(prov)
 	if !p.SupportsUsage() {
-		return
+		return nil, nil
 	}
 	info, err := p.FetchUsage(endpoint, authKey)
 	if err != nil {
 		log.Printf("keyring: fetch usage for key %d failed: %v", keyID, err)
-		return
+		return nil, err
 	}
 	if info.Ok && (info.CharacterCount != nil || info.CharacterLimit != nil) {
 		now := time.Now().UnixMilli()
 		if err := database.UpdateUsageSnapshot(kr.writeDB, keyID, info.CharacterCount, info.CharacterLimit, now); err != nil {
 			log.Printf("keyring: save usage for key %d failed: %v", keyID, err)
-			return
+			return nil, err
 		}
 		kr.invalidateKeyCache()
 	}
+	return info, nil
 }
 
 // RefreshAllUsage 查询所有 key（含未启用）的用量，用于启动时初始化。
 func (kr *Keyring) RefreshAllUsage() {
-	keys, err := database.GetAllKeys(kr.readDB)
+	keys, err := database.GetAllKeysWithAuth(kr.readDB)
 	if err != nil {
 		log.Printf("keyring: refresh all usage failed: %v", err)
 		return
@@ -198,20 +199,22 @@ func (kr *Keyring) Translate(keys []models.DeeplKey, req *provider.TranslateRequ
 			body = result.Body
 		}
 
-		siteType := "deeplx"
-		if k.Provider == "deepl" || k.Provider == "" {
-			siteType = provider.DetectSiteType(k.Endpoint)
-		}
-
-		if err == nil {
+		// provider 命中非成功状态码（456/429/5xx/401/403）时会同时返回 result 和 error，
+		// 只有连连接都没建立（result == nil）才是真正的 network_error。
+		// 若仅以 err == nil 判断，会把这些状态码全部误判为 network_error 而永不熔断。
+		if result != nil {
+			siteType := "deeplx"
+			if k.Provider == "deepl" || k.Provider == "" {
+				siteType = provider.DetectSiteType(k.Endpoint)
+			}
 			errType = provider.ClassifyError(statusCode, body, siteType)
 		}
 
 		// 打印上游错误详情
-		if err != nil {
-			log.Printf("keyring: key %s upstream error: %v", k.Name, err)
-		} else {
+		if result != nil {
 			log.Printf("keyring: key %s upstream %d [%s]: %s", k.Name, statusCode, errType, truncateStr(body, 200))
+		} else {
+			log.Printf("keyring: key %s network error: %v", k.Name, err)
 		}
 
 		kr.applyDisable(k, errType, statusCode, body, err)
@@ -274,8 +277,7 @@ func (kr *Keyring) RefreshUsage() []UsageRefreshResult {
 
 	var results []UsageRefreshResult
 	for _, k := range keys {
-		prov := provider.DetectProvider(k.Provider)
-		if !prov.SupportsUsage() {
+		if !provider.DetectProvider(k.Provider).SupportsUsage() {
 			results = append(results, UsageRefreshResult{
 				KeyName: k.Name,
 				Ok:      false,
@@ -283,7 +285,7 @@ func (kr *Keyring) RefreshUsage() []UsageRefreshResult {
 			})
 			continue
 		}
-		info, err := prov.FetchUsage(k.Endpoint, k.AuthKey)
+		info, err := kr.fetchAndSaveUsage(k.ID, k.AuthKey, k.Endpoint, k.Provider)
 		if err != nil {
 			results = append(results, UsageRefreshResult{
 				KeyName: k.Name,
@@ -292,11 +294,16 @@ func (kr *Keyring) RefreshUsage() []UsageRefreshResult {
 			})
 			continue
 		}
-		if info.Ok && (info.CharacterCount != nil || info.CharacterLimit != nil) {
-			now := time.Now().UnixMilli()
-			if dbErr := database.UpdateUsageSnapshot(kr.writeDB, k.ID, info.CharacterCount, info.CharacterLimit, now); dbErr != nil {
-				results = append(results, UsageRefreshResult{KeyName: k.Name, Ok: false, Error: dbErr.Error()})
-				continue
+		// 用量接口失败（403/401/456 等）说明 key 已不可用，按错误类型熔断，
+		// 避免前端仍显示 active。
+		if info != nil && !info.Ok {
+			siteType := "deeplx"
+			if k.Provider == "deepl" || k.Provider == "" {
+				siteType = provider.DetectSiteType(k.Endpoint)
+			}
+			errType := provider.ClassifyError(info.Status, info.Text, siteType)
+			if errType != "none" {
+				kr.applyDisable(k, errType, info.Status, info.Text, nil)
 			}
 		}
 		data := map[string]any{}
