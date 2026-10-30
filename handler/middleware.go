@@ -53,7 +53,7 @@ func RequestLogger() gin.HandlerFunc {
 		start := time.Now()
 
 		// ===== request-id（优先复用，没有就生成）=====
-		reqID := c.GetHeader("X-Request-ID")
+		reqID := sanitizeRequestID(c.GetHeader("X-Request-ID"))
 		if reqID == "" {
 			reqID = c.GetString("request_id")
 			if reqID == "" {
@@ -80,7 +80,7 @@ func RequestLogger() gin.HandlerFunc {
 		fmt.Printf(
 			"%s | %s | %s %s | %s%d%s | %s%v%s | %s%s\n",
 			now.Format("15:04:05"),
-			reqID[:8],
+			shortID(reqID),
 			c.Request.Method,
 			c.Request.URL.Path,
 
@@ -222,7 +222,8 @@ func verifySessionCookie(c *gin.Context, cfg *config.Config) bool {
 	if err != nil {
 		return false
 	}
-	if sig != expected {
+	// 用常数时间比较，避免按字节泄露 HMAC 前缀（== 会在第一个不同字节处返回）。
+	if !hmac.Equal([]byte(sig), []byte(expected)) {
 		return false
 	}
 
@@ -240,6 +241,41 @@ func verifySessionCookie(c *gin.Context, cfg *config.Config) bool {
 		return false
 	}
 	return time.Now().UnixMilli() < int64(exp)
+}
+
+// maxRequestIDLen 限制外部传入的 X-Request-ID 长度。
+// 这个值会被写进响应头和每一行访问日志，不设上限就是一个免费的
+// 日志投毒 / 内存放大入口。
+const maxRequestIDLen = 64
+
+// sanitizeRequestID 去掉控制字符并截断到 maxRequestIDLen。
+func sanitizeRequestID(s string) string {
+	if s == "" {
+		return ""
+	}
+	if len(s) > maxRequestIDLen {
+		s = s[:maxRequestIDLen]
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch < 0x20 || ch > 0x7e {
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+// shortID 取前 8 个字符用于日志前缀。
+// 修复点：旧代码直接 reqID[:8]，而 X-Request-ID 完全由调用方控制，
+// 传一个空串或不足 8 字节的值就会切出越界 panic（只能靠 gin.Recovery 兜底）。
+func shortID(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 func signPayload(payload string, cfg *config.Config) (string, error) {

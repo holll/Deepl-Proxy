@@ -37,6 +37,15 @@ type CacheConfig struct {
 	CleanupInterval  int `yaml:"cleanup_interval"`   // 秒
 	CleanupBatchSize int `yaml:"cleanup_batch_size"` // 条数
 	CleanupMaxRounds int `yaml:"cleanup_max_rounds"`
+
+	// LegacyKeyDisabled 关闭对 v1 旧缓存键的兼容读取。
+	//
+	// 故意用"禁用"而非"启用"语义：配置文件里缺省该项时布尔零值是 false，
+	// 也就是兼容读取默认开启。若写成 LegacyKeyEnabled，老配置文件（没有这一行）
+	// 会被解析成 false，升级瞬间缓存全部失效 —— 这正是要避免的事故。
+	//
+	// v1 旧行全部过期后（最长一个 TTL）可以设为 true 省掉这次额外查询。
+	LegacyKeyDisabled bool `yaml:"legacy_key_disabled"`
 }
 
 // TTLDuration 转换：统一提供一个方法

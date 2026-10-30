@@ -1,7 +1,10 @@
 package provider
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,9 +12,16 @@ import (
 	"time"
 )
 
+// maxUpstreamBodyBytes 单次上游响应体的上限。超过即报错。
+// 没有这个上限时 io.ReadAll 会把任意大的响应读进内存——
+// 在 1.8GB 的小内存机器上，一条异常响应就足以把进程打死。
+const maxUpstreamBodyBytes = 4 << 20 // 4 MiB
+
+var errBodyTooLarge = errors.New("upstream response body too large")
+
 // TranslateResult 上游翻译结果
 type TranslateResult struct {
-	Body       string
+	Body       []byte
 	StatusCode int
 	Headers    http.Header
 }
@@ -44,8 +54,8 @@ type TranslateRequest struct {
 // Provider 上游翻译服务接口
 type Provider interface {
 	Name() string
-	Translate(endpoint, authKey string, req *TranslateRequest) (*TranslateResult, error)
-	FetchUsage(endpoint, authKey string) (*UsageInfo, error)
+	Translate(ctx context.Context, endpoint, authKey string, req *TranslateRequest) (*TranslateResult, error)
+	FetchUsage(ctx context.Context, endpoint, authKey string) (*UsageInfo, error)
 	SupportsUsage() bool
 }
 
@@ -69,12 +79,12 @@ func DetectSiteType(endpoint string) string {
 }
 
 // parseUsageResponse 解析 DeepL usage 响应
-func parseUsageResponse(body string) (*UsageInfo, error) {
+func parseUsageResponse(body []byte) (*UsageInfo, error) {
 	var resp struct {
 		CharacterCount *int64 `json:"character_count"`
 		CharacterLimit *int64 `json:"character_limit"`
 	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
 	return &UsageInfo{
@@ -103,17 +113,25 @@ func ClassifyError(statusCode int, body, siteType string) string {
 
 // httpClient is the shared HTTP client for all provider calls.
 // Timeout prevents goroutine leaks on slow upstream responses.
+//
+// 注意 Proxy 必须显式设置：一旦自定义 Transport，http.DefaultTransport 的
+// 默认行为（含代理、HTTP/2、各类超时）就不再继承。
 var httpClient = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	},
 }
 
 // doPost helper
-func doPost(urlStr string, authHeader, contentType, body string, headers map[string]string) (*http.Response, error) {
-	req, err := http.NewRequest("POST", urlStr, strings.NewReader(body))
+func doPost(ctx context.Context, urlStr, authHeader, contentType string, body []byte, headers map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -130,8 +148,8 @@ func doPost(urlStr string, authHeader, contentType, body string, headers map[str
 }
 
 // doGet helper
-func doGet(urlStr string, authHeader string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", urlStr, nil)
+func doGet(ctx context.Context, urlStr, authHeader string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +160,7 @@ func doGet(urlStr string, authHeader string) (*http.Response, error) {
 }
 
 // deepLCompatTranslate 将翻译结果转为 DeepL 兼容格式
-func deepLCompatTranslate(text, sourceLang string) string {
+func deepLCompatTranslate(text, sourceLang string) []byte {
 	detected := sourceLang
 	if detected == "" {
 		detected = "EN"
@@ -156,7 +174,7 @@ func deepLCompatTranslate(text, sourceLang string) string {
 		},
 	}
 	b, _ := json.Marshal(resp)
-	return string(b)
+	return b
 }
 
 // BuildDeepLForm  构建 DeepL form-urlencoded body
@@ -178,11 +196,27 @@ func BuildDeepLForm(texts []string, targetLang, sourceLang string, extra url.Val
 }
 
 // readBody helper
-func readBody(resp *http.Response) (string, error) {
+//
+// 用 LimitReader + bytes.Buffer 一次读成 []byte：
+// 既避免 io.ReadAll 的多次扩容和 string(b) 的整段复制，
+// 又给响应体加上硬上限。
+func readBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+
+	limit := int64(maxUpstreamBodyBytes)
+	hint := int64(4 << 10)
+	if resp.ContentLength > 0 && resp.ContentLength < limit {
+		hint = resp.ContentLength
 	}
-	return string(b), nil
+
+	var buf bytes.Buffer
+	buf.Grow(int(hint))
+	n, err := io.Copy(&buf, io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if n > limit {
+		return nil, errBodyTooLarge
+	}
+	return buf.Bytes(), nil
 }

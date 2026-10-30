@@ -27,29 +27,40 @@ type DeeplKey struct {
 	UpdatedAtISO     *string `json:"updated_at_iso,omitempty"`
 }
 
-// TranslateCache 翻译缓存
+// TranslateCache 翻译缓存。
+// Body 用 []byte 而不是 string：命中路径上直接交给 c.Data 写出，
+// 避免 string→[]byte 的整份拷贝（string 无法与 []byte 共享底层数组）。
+// 写库时由 database.UpsertCache 转回 TEXT，保证管理端 LIKE 查询仍然可用。
 type TranslateCache struct {
 	CacheKey    string `json:"cache_key"`
-	Body        string `json:"body"`
+	Body        []byte `json:"-"`
 	HeadersJSON string `json:"headers_json"`
 	CreatedAt   int64  `json:"created_at"`
 	ExpiresAt   int64  `json:"expires_at"`
 }
 
-// CacheIdentity 构建缓存键的归一化参数
+// CacheIdentity 构建缓存键的归一化参数。
+// 取值必须与真正转发给上游的参数一一对应：多一个字段降低命中率，
+// 少一个字段就会把不同的上游请求折叠成同一条缓存（错误命中）。
+// 编码方式见 service.BuildCacheKey —— 长度前缀 + 固定字段序，不依赖 JSON。
 type CacheIdentity struct {
-	Text               []string `json:"text"`
-	TargetLang         string   `json:"target_lang"`
-	SourceLang         string   `json:"source_lang,omitempty"`
-	Formality          string   `json:"formality,omitempty"`
-	GlossaryID         string   `json:"glossary_id,omitempty"`
-	Context            string   `json:"context,omitempty"`
-	ModelType          string   `json:"model_type,omitempty"`
-	SplitSentences     string   `json:"split_sentences,omitempty"`
-	PreserveFormatting string   `json:"preserve_formatting,omitempty"`
-	TagHandling        string   `json:"tag_handling,omitempty"`
-	OutlineDetection   string   `json:"outline_detection,omitempty"`
-	NonSplittingTags   []string `json:"non_splitting_tags,omitempty"`
-	SplittingTags      []string `json:"splitting_tags,omitempty"`
-	IgnoreTags         []string `json:"ignore_tags,omitempty"`
+	Text               []string
+	TargetLang         string
+	SourceLang         string
+	Formality          string
+	GlossaryID         string
+	Context            string
+	ModelType          string
+	SplitSentences     string
+	PreserveFormatting string
+	TagHandling        string
+	OutlineDetection   string
+	// 这三个参数同样会被转发给上游，因此必须进键，
+	// 否则带不同指令的请求会共用同一条译文。
+	CustomInstructions   string
+	TagHandlingVersion   string
+	ShowBilledCharacters string
+	NonSplittingTags     []string
+	SplittingTags        []string
+	IgnoreTags           []string
 }

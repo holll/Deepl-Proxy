@@ -16,7 +16,7 @@ database:
   path: "./data/deepl-proxy.db"
 
 cache:
-  # 翻译缓存 TTL（秒），0 表示不缓存
+  # 翻译缓存 TTL（天），0 表示不缓存
   ttl_days: 365
   # 过期缓存清理间隔（秒）
   cleanup_interval: 3600
@@ -24,3 +24,6 @@ cache:
   cleanup_batch_size: 500
   # 每轮最多清理轮数
   cleanup_max_rounds: 20
+  # 关闭对旧版缓存键的兼容读取（默认关闭兼容=false，即兼容默认开启）。
+  # 旧版缓存全部过期后可以设为 true，省掉一次额外查询。
+  legacy_key_disabled: false

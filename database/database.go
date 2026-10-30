@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"deepl-proxy/models"
@@ -23,7 +24,16 @@ func Init(dbPath string) (writeDB *sql.DB, readDB *sql.DB) {
 		log.Fatalf("create db directory: %v", err)
 	}
 
-	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", dbPath)
+	// synchronous=NORMAL 是 WAL 模式下的推荐配置：不再每次提交都 fsync，
+	// 崩溃最多丢掉最后一个事务，不会损坏库。默认的 FULL 让每次缓存写入
+	// 都要等一次磁盘刷盘，在翻译这种"每请求一次小写"的场景里代价极高。
+	// cache_size=-16384 即 16MiB 页缓存（默认仅 2MiB），temp_store=MEMORY
+	// 让临时表/排序走内存。
+	dsn := fmt.Sprintf(
+		"%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"+
+			"&_pragma=synchronous(NORMAL)&_pragma=cache_size(-16384)&_pragma=temp_store(MEMORY)",
+		dbPath,
+	)
 
 	// Write connection — single writer, serialized
 	wdb, err := sql.Open("sqlite", dsn)
@@ -93,11 +103,69 @@ func migrate(db *sql.DB) {
 	}
 }
 
+// --- 预编译语句缓存 ---
+
+// stmtKey 以 (连接池, SQL) 为键。写库和读库是两套连接池，
+// 同一个 SQL 在两边必须是各自独立的 *sql.Stmt。
+type stmtKey struct {
+	db *sql.DB
+	q  string
+}
+
+var stmtCache sync.Map // stmtKey -> *sql.Stmt
+
+// prepare 复用已编译的语句。
+//
+// database/sql 在直接 db.Exec/db.Query 时每次调用都会重新 Prepare，
+// 而 modernc.org/sqlite 每次 Prepare 都要重新编译一遍 SQL 虚拟机——
+// 对"每请求至少一次查询"的热路径来说这是纯浪费。
+func prepare(db *sql.DB, q string) (*sql.Stmt, error) {
+	k := stmtKey{db: db, q: q}
+	if v, ok := stmtCache.Load(k); ok {
+		return v.(*sql.Stmt), nil
+	}
+	st, err := db.Prepare(q)
+	if err != nil {
+		return nil, err
+	}
+	actual, loaded := stmtCache.LoadOrStore(k, st)
+	if loaded {
+		// 并发下别的 goroutine 先存了，丢掉自己这份，避免泄漏语句句柄。
+		_ = st.Close()
+		return actual.(*sql.Stmt), nil
+	}
+	return st, nil
+}
+
+func exec(db *sql.DB, q string, args ...any) (sql.Result, error) {
+	st, err := prepare(db, q)
+	if err != nil {
+		return nil, err
+	}
+	return st.Exec(args...)
+}
+
+func query(db *sql.DB, q string, args ...any) (*sql.Rows, error) {
+	st, err := prepare(db, q)
+	if err != nil {
+		return nil, err
+	}
+	return st.Query(args...)
+}
+
+func queryRow(db *sql.DB, q string, args ...any) (*sql.Row, error) {
+	st, err := prepare(db, q)
+	if err != nil {
+		return nil, err
+	}
+	return st.QueryRow(args...), nil
+}
+
 // --- deepl_keys CRUD ---
 
 func InsertKey(db *sql.DB, name, authKey, endpoint, provider string) (int64, error) {
 	now := time.Now().UnixMilli()
-	res, err := db.Exec(
+	res, err := exec(db,
 		"INSERT INTO deepl_keys (name,auth_key,endpoint,provider,status,created_at,updated_at) VALUES (?,?,?,?,'active',?,?)",
 		name, authKey, endpoint, provider, now, now,
 	)
@@ -110,13 +178,13 @@ func InsertKey(db *sql.DB, name, authKey, endpoint, provider string) (int64, err
 func UpdateKey(db *sql.DB, id int64, name, authKey, endpoint, provider, status *string) error {
 	now := time.Now().UnixMilli()
 	if status != nil && *status == "active" {
-		_, err := db.Exec(
+		_, err := exec(db,
 			"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), status=?, disable_type=NULL, disabled_until=NULL, updated_at=? WHERE id=?",
 			name, authKey, endpoint, provider, *status, now, id,
 		)
 		return err
 	}
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), status=COALESCE(?,status), updated_at=? WHERE id=?",
 		name, authKey, endpoint, provider, status, now, id,
 	)
@@ -124,7 +192,7 @@ func UpdateKey(db *sql.DB, id int64, name, authKey, endpoint, provider, status *
 }
 
 func DeleteKey(db *sql.DB, id int64) error {
-	_, err := db.Exec("DELETE FROM deepl_keys WHERE id=?", id)
+	_, err := exec(db, "DELETE FROM deepl_keys WHERE id=?", id)
 	return err
 }
 
@@ -134,7 +202,7 @@ func GetActiveKeys(db *sql.DB) ([]models.DeeplKey, error) {
 
 // ReactivateExpiredKeys 将已过禁用期的 key 恢复为 active 状态。
 func ReactivateExpiredKeys(db *sql.DB, now int64) error {
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET status='active',disable_type=NULL,disabled_until=NULL,updated_at=? WHERE status='disabled' AND disabled_until IS NOT NULL AND disabled_until<=?",
 		now, now,
 	)
@@ -150,8 +218,8 @@ func GetAllKeysWithAuth(db *sql.DB) ([]models.DeeplKey, error) {
 	return queryKeys(db, "SELECT * FROM deepl_keys ORDER BY id ASC")
 }
 
-func queryKeys(db *sql.DB, query string, args ...any) ([]models.DeeplKey, error) {
-	rows, err := db.Query(query, args...)
+func queryKeys(db *sql.DB, q string, args ...any) ([]models.DeeplKey, error) {
+	rows, err := query(db, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -189,10 +257,10 @@ func queryKeys(db *sql.DB, query string, args ...any) ([]models.DeeplKey, error)
 			LastUsedAt:       nullableInt64(m["last_used_at"]),
 			LastCheckedAt:    nullableInt64(m["last_checked_at"]),
 			// 用量列 0 是合法值（免费额度 0 / 已用 0），不能当 NULL 丢弃
-			CharacterCount:   nullableInt64KeepZero(m["character_count"]),
-			CharacterLimit:   nullableInt64KeepZero(m["character_limit"]),
-			CreatedAt:        int64Val(m["created_at"]),
-			UpdatedAt:        int64Val(m["updated_at"]),
+			CharacterCount: nullableInt64KeepZero(m["character_count"]),
+			CharacterLimit: nullableInt64KeepZero(m["character_limit"]),
+			CreatedAt:      int64Val(m["created_at"]),
+			UpdatedAt:      int64Val(m["updated_at"]),
 		}
 		if k.Provider == "" {
 			k.Provider = "deepl"
@@ -210,30 +278,63 @@ func queryKeys(db *sql.DB, query string, args ...any) ([]models.DeeplKey, error)
 
 // --- 缓存操作 ---
 
+// GetCacheByKey 命中返回条目，未命中/已过期返回 (nil, nil)。
+// 用 query + rows 而不是 QueryRow，就是为了能把 sql.ErrNoRows 正常折叠成"未命中"。
 func GetCacheByKey(db *sql.DB, cacheKey string, now int64) (*models.TranslateCache, error) {
-	row := db.QueryRow(
+	rows, err := query(db,
 		"SELECT cache_key, body, headers_json, created_at, expires_at FROM deepl_translation_cache WHERE cache_key=? AND expires_at>?",
 		cacheKey, now,
 	)
-	var c models.TranslateCache
-	err := row.Scan(&c.CacheKey, &c.Body, &c.HeadersJSON, &c.CreatedAt, &c.ExpiresAt)
 	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var c models.TranslateCache
+	if err := rows.Scan(&c.CacheKey, &c.Body, &c.HeadersJSON, &c.CreatedAt, &c.ExpiresAt); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
+// UpsertCache 写入缓存。
+//
+// 用 ON CONFLICT ... DO UPDATE 而不是 INSERT OR REPLACE：后者等价于
+// DELETE + INSERT，会换掉 rowid、多写一次索引，并把 created_at 覆盖成
+// 最新一次写入时间（admin 里显示"创建时间"其实变成"最后写入时间"）。
 func UpsertCache(db *sql.DB, c *models.TranslateCache) error {
-	_, err := db.Exec(
-		"INSERT OR REPLACE INTO deepl_translation_cache (cache_key,body,headers_json,created_at,expires_at) VALUES (?,?,?,?,?)",
-		c.CacheKey, c.Body, c.HeadersJSON, c.CreatedAt, c.ExpiresAt,
+	_, err := exec(db,
+		`INSERT INTO deepl_translation_cache (cache_key,body,headers_json,created_at,expires_at)
+		 VALUES (?,?,?,?,?)
+		 ON CONFLICT(cache_key) DO UPDATE SET
+		   body=excluded.body,
+		   headers_json=excluded.headers_json,
+		   expires_at=excluded.expires_at`,
+		c.CacheKey, string(c.Body), c.HeadersJSON, c.CreatedAt, c.ExpiresAt,
 	)
 	return err
 }
 
-func UpdateCacheExpiry(db *sql.DB, cacheKey string, expiresAt int64) error {
-	_, err := db.Exec("UPDATE deepl_translation_cache SET expires_at=? WHERE cache_key=?", expiresAt, cacheKey)
-	return err
+// CompareAndRenewCache 用 CAS 续期：只有 expires_at 仍是读取时的值才更新。
+//
+// 并发命中同一 key 时只有一个能更新成功，其余空转返回 false，
+// 避免 N 个请求同时对单写连接做一次无条件 UPDATE。
+func CompareAndRenewCache(db *sql.DB, cacheKey string, oldExpiresAt, newExpiresAt int64) (bool, error) {
+	res, err := exec(db,
+		"UPDATE deepl_translation_cache SET expires_at=? WHERE cache_key=? AND expires_at=?",
+		newExpiresAt, cacheKey, oldExpiresAt,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // ListCacheEntries 列出缓存条目，支持搜索和分页。
@@ -255,11 +356,15 @@ func ListCacheEntries(db *sql.DB, search string, limit, offset int) ([]models.Tr
 	}
 
 	var total int
-	if err := db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+	row, err := queryRow(db, countQuery, countArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := row.Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	rows, err := db.Query(listQuery, listArgs...)
+	rows, err := query(db, listQuery, listArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -277,15 +382,18 @@ func ListCacheEntries(db *sql.DB, search string, limit, offset int) ([]models.Tr
 }
 
 func DeleteCacheByKey(db *sql.DB, cacheKey string) error {
-	_, err := db.Exec("DELETE FROM deepl_translation_cache WHERE cache_key=?", cacheKey)
+	_, err := exec(db, "DELETE FROM deepl_translation_cache WHERE cache_key=?", cacheKey)
 	return err
 }
 
 func CleanExpiredCache(db *sql.DB, batchSize, maxRounds int) error {
 	now := time.Now().UnixMilli()
-	for i := 0; i < maxRounds; i++ {
-		res, err := db.Exec(
-			"DELETE FROM deepl_translation_cache WHERE cache_key IN (SELECT cache_key FROM deepl_translation_cache WHERE expires_at<=? LIMIT ?)",
+	for range maxRounds {
+		// 用 rowid 而不是 cache_key 作为内层选择列：
+		// expires_at 索引里本来就带着 rowid，这个子查询可以完全走索引，
+		// 不需要回表取 cache_key；外层也直接按 rowid 删，最快。
+		res, err := exec(db,
+			"DELETE FROM deepl_translation_cache WHERE rowid IN (SELECT rowid FROM deepl_translation_cache WHERE expires_at<=? LIMIT ?)",
 			now, batchSize,
 		)
 		if err != nil {
@@ -302,7 +410,7 @@ func CleanExpiredCache(db *sql.DB, batchSize, maxRounds int) error {
 // --- D1 兼容熔断辅助 ---
 
 func DisableKeyTemporary(db *sql.DB, keyID int64, errorCode, errorMessage string, ms int64, now int64) error {
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET status='disabled',disable_type='temporary',disabled_until=?,last_error_code=?,last_error_message=?,updated_at=? WHERE id=?",
 		now+ms, truncate(errorCode, 100), truncate(errorMessage, 500), now, keyID,
 	)
@@ -311,7 +419,7 @@ func DisableKeyTemporary(db *sql.DB, keyID int64, errorCode, errorMessage string
 
 func DisableKeyMonthly(db *sql.DB, keyID int64, errorCode, errorMessage string, now int64) error {
 	beginning := startOfNextMonthBeijing(time.UnixMilli(now)).UnixMilli()
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET status='disabled',disable_type='monthly',disabled_until=?,last_error_code=?,last_error_message=?,updated_at=? WHERE id=?",
 		beginning, truncate(errorCode, 100), truncate(errorMessage, 500), now, keyID,
 	)
@@ -319,7 +427,7 @@ func DisableKeyMonthly(db *sql.DB, keyID int64, errorCode, errorMessage string, 
 }
 
 func DisableKeyPermanent(db *sql.DB, keyID int64, errorCode, errorMessage string, now int64) error {
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET status='dead',disable_type='permanent',disabled_until=NULL,last_error_code=?,last_error_message=?,updated_at=? WHERE id=?",
 		truncate(errorCode, 100), truncate(errorMessage, 500), now, keyID,
 	)
@@ -327,7 +435,7 @@ func DisableKeyPermanent(db *sql.DB, keyID int64, errorCode, errorMessage string
 }
 
 func UpdateUsageSnapshot(db *sql.DB, keyID int64, charCount, charLimit *int64, now int64) error {
-	_, err := db.Exec(
+	_, err := exec(db,
 		"UPDATE deepl_keys SET character_count=?,character_limit=?,last_checked_at=?,updated_at=? WHERE id=?",
 		nullInt64(charCount), nullInt64(charLimit), now, now, keyID,
 	)
@@ -344,10 +452,7 @@ func startOfNextMonthBeijing(now time.Time) time.Time {
 }
 
 func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max]
+	return s[:min(len(s), max)]
 }
 
 func nullInt64(v *int64) any {

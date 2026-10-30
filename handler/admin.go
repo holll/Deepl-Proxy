@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -85,9 +86,8 @@ func handleAdminKeyCreate(kr *service.Keyring) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "name and endpoint required"})
 			return
 		}
-		if body.Provider == "" {
-			body.Provider = "deepl"
-		}
+		// cmp.Or 取第一个非零值，等价于 "空则默认 deepl"。
+		body.Provider = cmp.Or(body.Provider, "deepl")
 
 		id, err := kr.AddKey(body.Name, body.AuthKey, body.Endpoint, body.Provider)
 		if err != nil {
@@ -147,7 +147,7 @@ func handleAdminKeyDelete(kr *service.Keyring) gin.HandlerFunc {
 
 func handleUsageRefresh(kr *service.Keyring) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		results := kr.RefreshUsage()
+		results := kr.RefreshUsage(c.Request.Context())
 		c.JSON(http.StatusOK, gin.H{"results": results})
 	}
 }
@@ -225,8 +225,8 @@ func handleCacheDelete(kr *service.Keyring) gin.HandlerFunc {
 
 // previewBody 从缓存 body 中提取可读预览。
 // body 是 DeepL 兼容 JSON: {"translations":[{"detected_source_language":"EN","text":"..."}]}
-func previewBody(body string) string {
-	if body == "" {
+func previewBody(body []byte) string {
+	if len(body) == 0 {
 		return "(empty)"
 	}
 	var v struct {
@@ -234,18 +234,14 @@ func previewBody(body string) string {
 			Text string `json:"text"`
 		} `json:"translations"`
 	}
-	if json.Unmarshal([]byte(body), &v) == nil && len(v.Translations) > 0 {
-		t := v.Translations[0].Text
-		//if len(t) > 80 {
-		//	return t[:80] + "..."
-		//}
-		return t
+	if json.Unmarshal(body, &v) == nil && len(v.Translations) > 0 {
+		return v.Translations[0].Text
 	}
-	// fallback: raw truncate
-	if len(body) > 80 {
-		return body[:80] + "..."
+	// fallback: raw truncate，按 rune 截断避免切碎多字节字符产生非法 UTF-8
+	if r := []rune(string(body)); len(r) > 80 {
+		return string(r[:80]) + "..."
 	}
-	return body
+	return string(body)
 }
 
 // --- helpers ---

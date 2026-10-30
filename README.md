@@ -44,7 +44,9 @@
 - 响应自动附加 `Cache-Control: public, max-age=N`，外层 CDN 可直接缓存；
 - 响应头 `X-Cache-Status`：`HIT`（SQLite 命中）/ `MISS`（上游翻译）；
 - 缓存数据不保存 `X-Upstream-Key-Name`，避免暴露上游 key 标识；
-- 过期缓存由后台 goroutine 定时清理，不影响实时请求。
+- 过期缓存由后台 goroutine 定时清理，不影响实时请求；
+- **击穿保护**：同一份文本的并发未命中会被合并成一次上游调用，其余请求等待并复用结果；等待方仍可被自己的客户端取消（立即返回 499，不陪跑）；
+- **升级兼容**：缓存键格式变更过（新增 provider 维度），新版启动后会先按新键查，未命中的再按旧键查一次，命中就地迁移到新键。因此升级不会导致既有缓存失效，旧行会按自己的过期时间自然回收，回滚到旧版本也仍能命中。旧行全部过期后可把 `cache.legacy_key_disabled` 设为 `true` 关掉这次额外查询。
 
 ---
 
@@ -52,6 +54,7 @@
 
 ```
 ├── main.go                  # 入口：配置加载、数据库初始化、路由注册、启动
+├── main_test.go             # 端到端测试：真实 HTTP 路由 + 本地假上游
 ├── go.mod / go.sum          # Go module 依赖
 ├── config.yaml              # 配置文件（YAML）
 ├── config/
@@ -59,18 +62,26 @@
 ├── models/
 │   └── models.go            # 数据类型定义
 ├── database/
-│   └── database.go          # SQLite 初始化、建表迁移、CRUD
+│   ├── database.go          # SQLite 初始化、建表迁移、CRUD
+│   └── database_test.go     # 缓存 CRUD / CAS 续期 / 过期清理
 ├── provider/
 │   ├── provider.go          # Provider 接口定义 + 错误分类
 │   ├── deepl.go             # DeepL 上游（form-urlencoded）
-│   └── deeplx.go            # DeepLX 上游（JSON，响应转 DeepL 兼容）
+│   ├── deeplx.go            # DeepLX 上游（JSON，响应转 DeepL 兼容）
+│   └── provider_test.go     # 响应体上限 / context 取消 / header 隔离
 ├── service/
 │   ├── keyring.go           # Key 轮询、熔断、用量采样
-│   └── cache.go             # 缓存服务 + CDN 友好响应头
+│   ├── cache.go             # 缓存服务 + CDN 友好响应头
+│   ├── legacykey.go         # v1 缓存键复刻（升级兼容读取）
+│   ├── flight.go            # 并发请求合并（防缓存击穿）
+│   ├── cachekey_test.go     # 缓存键构造与 provider 可服务性判断
+│   ├── legacykey_test.go    # v1 键与历史版本逐字节对齐
+│   └── flight_test.go       # 合并行为 / ctx 取消 / panic 释放等待方
 ├── handler/
 │   ├── middleware.go        # CORS / Gateway Auth / Admin Auth (HMAC)
 │   ├── translate.go         # 翻译 API + 路由注册
-│   └── admin.go             # 管理后台 API
+│   ├── admin.go             # 管理后台 API
+│   └── middleware_test.go   # 请求 ID 清洗 / 鉴权中间件
 └── webui/                   # 管理后台前端（嵌入二进制）
     ├── index.html
     ├── app.js
@@ -82,7 +93,7 @@
 ## 3. 快速开始
 
 ### 3.1 前置条件
-- Go 1.22+
+- Go 1.27+
 - SQLite 无需额外安装（使用纯 Go 驱动 `modernc.org/sqlite`）
 
 ### 3.2 编译
@@ -94,7 +105,15 @@ set GOPROXY=https://goproxy.cn,direct
 go build -o deepl-proxy .
 ```
 
-### 3.3 配置
+### 3.3 测试
+
+```bash
+go test ./...
+```
+
+测试覆盖六块：缓存键构造（provider 维度、参数完整性、文本不被归一化）、v1 旧键兼容（与历史实现逐字节对齐、就地迁移、条数校验）、并发合并（击穿保护、等待方 ctx 取消、不合并 `x-no-cache`）、SQLite 缓存层（CAS 续期、过期清理、`created_at` 保留）、上游 provider（响应体上限、context 取消、错误响应头隔离）、以及通过真实 HTTP 路由的端到端行为（provider 切换不串缓存、`ttl_days=0` 不读旧行、请求头健壮性）。端到端用例使用本地假上游，不需要真实的 DeepL Key，也不会产生调用费用。
+
+### 3.4 配置
 
 编辑 `config.yaml` 或通过环境变量覆盖：
 
@@ -114,7 +133,7 @@ database:
   path: "./data/deepl-proxy.db"
 
 cache:
-  ttl: 86400                # 翻译缓存 TTLDays（秒），0 表示不缓存
+  ttl_days: 1               # 翻译缓存 TTL（天），0 表示不缓存
   cleanup_interval: 600     # 过期缓存清理间隔（秒）
   cleanup_batch_size: 500
   cleanup_max_rounds: 20
@@ -130,7 +149,7 @@ cache:
 | `ALLOW_ORIGIN` | `server.allow_origin` | 否 |
 | `PORT` | `server.port` | 否 |
 
-### 3.4 运行
+### 3.5 运行
 
 ```bash
 deepl-proxy.exe
@@ -139,7 +158,7 @@ deepl-proxy.exe
 
 数据库文件 `data/deepl-proxy.db` 和所需表结构自动创建，无需手动建表。
 
-### 3.5 外层 CDN 配置建议
+### 3.6 外层 CDN 配置建议
 
 Go 服务返回的翻译响应自带 `Cache-Control: public, max-age=86400`。在外层 CDN（如 Cloudflare、Nginx）上配置：
 - 允许缓存 POST 请求的响应；
@@ -229,3 +248,8 @@ set GOCACHE=./.gocache
 
 ### 6.4 如何重置数据库？
 删除 `data/deepl-proxy.db`，重启服务会自动重建。
+
+### 6.5 升级后缓存会失效吗？
+不会。缓存键升级为带 provider 维度的新格式后，读取路径保留了旧键兼容：新键未命中时按旧键再查一次，命中就把它迁移写入新键。代价是迁移期内每个旧条目会多一次索引查询，并且第一次命中后会多一次写入。
+
+两类请求不会走旧键兼容：带了 `custom_instructions` / `tag_handling_version` / `show_billed_characters` 的请求（旧版本会静默丢弃这些参数，旧行不能代表它们的语义），以及译文条数与本次请求不符的旧行（旧键不含 provider 维度，`deeplx` 产出的行只有一条译文，回放给多 text 请求会是结构错误的响应）。

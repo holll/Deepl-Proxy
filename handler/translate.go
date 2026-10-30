@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,43 +52,45 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 	}
 
 	// 翻译 API（需要网关认证）
+	//
+	// flight 提到路由层共享：/v2/translate 与 /translate 是同一条业务路径，
+	// 共用一份合并表才能让两个入口的并发请求也合并成一次上游调用。
+	flight := service.NewFlight[upstreamOutcome]()
+
 	translate := r.Group("")
 	translate.Use(GatewayAuthMiddleware(cfg))
 	{
-		translate.POST("/v2/translate", handleTranslateCompat(cfg, kr, cs))
-		translate.POST("/translate", handleTranslateCompat(cfg, kr, cs))
+		translate.POST("/v2/translate", handleTranslateCompat(cfg, kr, cs, flight))
+		translate.POST("/translate", handleTranslateCompat(cfg, kr, cs, flight))
 		translate.GET("/v2/usage", handleUsageCompat(cfg, kr))
 	}
 }
 
 // --- 翻译 API ---
 
-func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.CacheService) gin.HandlerFunc {
+// upstreamOutcome 是 keyring.Translate 的返回值打包，
+// 以便交给 Flight 泛型合并。
+type upstreamOutcome struct {
+	result  *provider.TranslateResult
+	usedKey *models.DeeplKey
+	failure *service.FailureInfo
+	err     error
+}
+
+func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.CacheService, flight *service.Flight[upstreamOutcome]) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 解析请求（支持 JSON 和 form-urlencoded）
-		texts, targetLang, sourceLang, extraParams, tagArrayParams, identity, err := parseTranslateRequest(c)
+		parsed, err := parseTranslateRequest(c)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 			return
 		}
 
-		// 检查是否跳过缓存
-		skipCache := service.IsNoCacheRequest(c.Request)
-
-		// 尝试缓存命中
-		var cacheKey string
-		if !skipCache {
-			cacheKey, _ = service.BuildCacheKey(identity)
-			if cacheKey != "" {
-				if hit, err := cs.Get(cacheKey); err == nil && hit != nil {
-					writeCacheHeaders(c, hit.Headers, cs.CacheControlHeader(), "HIT")
-					c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(hit.Body))
-					return
-				}
-			}
-		}
-
-		// 获取 active keys
+		// 先决定"由哪类 provider 服务"，再算缓存键。
+		//
+		// 顺序很关键：缓存键里带 provider 类别，而类别取决于本次可用的 key
+		// 和请求形状。先查缓存就必须先猜一个类别——这正是旧实现
+		// "deeplx 的单条译文被当作 deepl 的三条译文回放"的根因。
 		keys, err := kr.GetActiveKeys()
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Failed to get keys"})
@@ -97,20 +101,56 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 			return
 		}
 
+		sel, ok := kr.Select(keys, len(parsed.texts), parsed.extraParams)
+		if !ok {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"message": "No key can serve this request: deeplx keys accept exactly one text and ignore formality/glossary_id/context/model_type/split_sentences/preserve_formatting/outline_detection",
+			})
+			return
+		}
+
+		// 检查是否跳过缓存
+		skipCache := service.IsNoCacheRequest(c.Request)
+
+		// 尝试缓存命中
+		var cacheKey string
+		if !skipCache {
+			cacheKey = service.BuildCacheKey(parsed.identity, sel.ProviderClass)
+			// v1 旧键只用于兼容读取：新旧键格式不兼容，否则线上已有一批旧行会全部失联。
+			//
+			// 但仅限"v1 能表达"的请求。v1 时代 custom_instructions /
+			// tag_handling_version / show_billed_characters 是被静默丢弃的，
+			// 那时的缓存行等价于"没带这些参数"的译文；现在这些参数会被真实转发，
+			// 若仍用 v1 键去读，就会把忽略指令的旧译文当成带指令的结果返回。
+			// 这类请求直接跳过兼容读取，多一次上游调用换取语义正确。
+			var legacyKey string
+			if parsed.identity.CustomInstructions == "" &&
+				parsed.identity.TagHandlingVersion == "" &&
+				parsed.identity.ShowBilledCharacters == "" {
+				legacyKey = service.BuildLegacyCacheKey(parsed.identity)
+			}
+			if hit, err := cs.Get(cacheKey, legacyKey, len(parsed.texts)); err == nil && hit != nil {
+				writeCacheHeaders(c, hit.Headers, cs.CacheControlHeader(), "HIT")
+				// hit.Body 已经是 []byte，直接写，不再 string→[]byte 复制一次。
+				c.Data(http.StatusOK, "application/json; charset=utf-8", hit.Body)
+				return
+			}
+		}
+
 		// 构建 form params（DeepL 兼容）
-		formValues := url.Values{}
-		for _, t := range texts {
+		formValues := make(url.Values, len(parsed.extraParams)+len(parsed.tagArrayParams)+3)
+		for _, t := range parsed.texts {
 			formValues.Add("text", t)
 		}
-		formValues.Set("target_lang", strings.ToUpper(targetLang))
-		if sourceLang != "" {
-			formValues.Set("source_lang", strings.ToUpper(sourceLang))
+		formValues.Set("target_lang", strings.ToUpper(parsed.targetLang))
+		if parsed.sourceLang != "" {
+			formValues.Set("source_lang", strings.ToUpper(parsed.sourceLang))
 		}
-		for k, v := range extraParams {
+		for k, v := range parsed.extraParams {
 			formValues.Set(k, v)
 		}
 		// 添加数组型 tag 参数（如 non_splitting_tags=S1&non_splitting_tags=S2）
-		for k, vs := range tagArrayParams {
+		for k, vs := range parsed.tagArrayParams {
 			for _, v := range vs {
 				formValues.Add(k, v)
 			}
@@ -118,201 +158,229 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 
 		// 构建 provider request
 		req := &provider.TranslateRequest{
-			Text:             texts,
-			TargetLang:       targetLang,
-			SourceLang:       sourceLang,
+			Text:             parsed.texts,
+			TargetLang:       parsed.targetLang,
+			SourceLang:       parsed.sourceLang,
 			FormParams:       formValues.Encode(),
-			TagHandling:      extraParams["tag_handling"],
-			NonSplittingTags: tagArrayParams["non_splitting_tags"],
-			SplittingTags:    tagArrayParams["splitting_tags"],
-			IgnoreTags:       tagArrayParams["ignore_tags"],
+			TagHandling:      parsed.extraParams["tag_handling"],
+			NonSplittingTags: parsed.tagArrayParams["non_splitting_tags"],
+			SplittingTags:    parsed.tagArrayParams["splitting_tags"],
+			IgnoreTags:       parsed.tagArrayParams["ignore_tags"],
 		}
 
-		// 轮询 key
-		result, usedKey, failure, translateErr := kr.Translate(keys, req)
-		if translateErr != nil && result == nil {
-			msg := "All keys unavailable"
-			if failure != nil {
-				msg = "All keys unavailable, last failure: " + failure.KeyName
+		// 上游调用：ctx 一路传到 http，客户端断开即取消付费的上游请求。
+		callUpstream := func(ctx context.Context) upstreamOutcome {
+			result, usedKey, failure, translateErr := kr.Translate(ctx, sel, req)
+			return upstreamOutcome{result: result, usedKey: usedKey, failure: failure, err: translateErr}
+		}
+
+		// 缓存击穿保护：同一 cacheKey 的并发 miss 只打一次上游。
+		//
+		// 不用 Do 而用带 ctx 的合并，是因为等待方可能先于 leader 取消：
+		// 那样它应该立刻返回 499，而不是替别人陪跑到 15 秒超时。
+		// skipCache（x-no-cache）请求不参与合并——它们本来就有意绕过缓存。
+		var out upstreamOutcome
+		if skipCache || cacheKey == "" {
+			out = callUpstream(c.Request.Context())
+		} else {
+			v, _, flightErr := flight.Do(c.Request.Context(), cacheKey,
+				func(leaderCtx context.Context) (upstreamOutcome, error) {
+					o := callUpstream(leaderCtx)
+					// 只有 leader 会执行到这里，因此缓存写入天然只发生一次。
+					if o.result != nil && o.result.StatusCode == http.StatusOK {
+						cs.Put(cacheKey, o.result.Body, buildResponseHeaders(o.result, o.usedKey))
+					}
+					return o, nil
+				})
+			if flightErr != nil {
+				// 等待期间自己的 ctx 结束：客户端已经走了，不必再写响应体。
+				if c.Request.Context().Err() != nil {
+					c.AbortWithStatus(499)
+					return
+				}
+				c.JSON(http.StatusBadGateway, gin.H{"message": "Upstream call failed"})
+				return
 			}
-			c.JSON(http.StatusBadGateway, gin.H{"message": msg, "lastFailure": failure})
+			out = v
+		}
+
+		if out.result == nil {
+			msg := "All keys unavailable"
+			if out.failure != nil {
+				msg = "All keys unavailable, last failure: " + out.failure.KeyName
+			}
+			if out.err != nil && c.Request.Context().Err() != nil {
+				// 客户端已经走了，没必要再写响应体。
+				c.AbortWithStatus(499)
+				return
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"message": msg, "lastFailure": out.failure})
 			return
 		}
 
-		// 构建响应
-		respHeaders := make(http.Header)
-		if result != nil {
-			for k, vs := range result.Headers {
-				for _, v := range vs {
-					respHeaders.Add(k, v)
-				}
-			}
-		}
-		if usedKey != nil {
-			respHeaders.Set("X-Upstream-Key-Name", usedKey.Name)
-			siteType := provider.DetectSiteType(usedKey.Endpoint)
-			if usedKey.Provider == "deeplx" {
-				siteType = "deeplx"
-			}
-			respHeaders.Set("X-Key-Site-Type", siteType)
-		}
-
-		// 缓存成功响应
-		if cacheKey != "" && result.StatusCode == http.StatusOK {
-			cs.Put(cacheKey, result.Body, respHeaders)
-		}
-
+		respHeaders := buildResponseHeaders(out.result, out.usedKey)
 		writeCacheHeaders(c, respHeaders, cs.CacheControlHeader(), "MISS")
 
-		if result.StatusCode != http.StatusOK {
-			c.JSON(result.StatusCode, json.RawMessage(result.Body))
-			return
-		}
-		c.Data(result.StatusCode, "application/json; charset=utf-8", []byte(result.Body))
+		c.Data(out.result.StatusCode, "application/json; charset=utf-8", out.result.Body)
 	}
 }
 
-func parseTranslateRequest(c *gin.Context) (texts []string, targetLang, sourceLang string, extraParams map[string]string, tagArrayParams map[string][]string, identity *models.CacheIdentity, err error) {
-	extraParams = make(map[string]string)
-	tagArrayParams = make(map[string][]string)
+// buildResponseHeaders 组装回给客户端的响应头。
+// 同一份结果既用于响应也用于写缓存（写缓存前会由 CacheService 过滤敏感头）。
+func buildResponseHeaders(result *provider.TranslateResult, usedKey *models.DeeplKey) http.Header {
+	headers := make(http.Header, len(result.Headers)+2)
+	for k, vs := range result.Headers {
+		for _, v := range vs {
+			headers.Add(k, v)
+		}
+	}
+	if usedKey != nil {
+		headers.Set("X-Upstream-Key-Name", usedKey.Name)
+		siteType := provider.DetectSiteType(usedKey.Endpoint)
+		if usedKey.Provider == "deeplx" {
+			siteType = "deeplx"
+		}
+		headers.Set("X-Key-Site-Type", siteType)
+	}
+	return headers
+}
+
+// translateParams 一次解析出的全部请求参数。
+//
+// 旧实现先解析一遍字段，再回头遍历同一个 map 生成缓存身份，
+// 文本被 toString（可能 json.Marshal）两次。现在解析一次就够，
+// 缓存身份直接由已解析的字段拼出来，语义完全一致但没有第二遍。
+type translateParams struct {
+	texts          []string
+	targetLang     string
+	sourceLang     string
+	extraParams    map[string]string
+	tagArrayParams map[string][]string
+	identity       *models.CacheIdentity
+}
+
+// scalarExtraFields 会原样转发给上游、并且必须参与缓存键的标量参数。
+//
+// custom_instructions / tag_handling_version / show_billed_characters 此前
+// 既没转发也没进键：调用方传了参数却得到一个"当作没传"的结果，还会和
+// 没传该参数的请求共用同一份缓存。要么转发并进键，要么明确拒绝，不能静默丢弃。
+var scalarExtraFields = []string{
+	"formality", "glossary_id", "context", "model_type",
+	"split_sentences", "preserve_formatting", "tag_handling", "outline_detection",
+	"custom_instructions", "tag_handling_version", "show_billed_characters",
+}
+
+var tagArrayFields = []string{"non_splitting_tags", "splitting_tags", "ignore_tags"}
+
+func parseTranslateRequest(c *gin.Context) (*translateParams, error) {
+	p := &translateParams{
+		extraParams:    make(map[string]string, len(scalarExtraFields)),
+		tagArrayParams: make(map[string][]string, len(tagArrayFields)),
+	}
 
 	ct := c.GetHeader("Content-Type")
 
 	if strings.Contains(ct, "application/json") {
 		var body map[string]any
 		if err := c.ShouldBindJSON(&body); err != nil {
-			return nil, "", "", nil, nil, nil, err
+			return nil, err
 		}
 
 		// 解析 text
 		switch v := body["text"].(type) {
 		case string:
-			texts = []string{v}
+			p.texts = []string{v}
 		case []any:
+			p.texts = make([]string, 0, len(v))
 			for _, item := range v {
-				texts = append(texts, toString(item))
+				p.texts = append(p.texts, toString(item))
 			}
 		default:
-			return nil, "", "", nil, nil, nil, fmtStr("text is required")
+			return nil, errors.New("text is required")
 		}
-		if len(texts) == 0 {
-			return nil, "", "", nil, nil, nil, fmtStr("text is required")
+		if len(p.texts) == 0 {
+			return nil, errors.New("text is required")
 		}
 
 		tl, ok := body["target_lang"].(string)
 		if !ok || tl == "" {
-			return nil, "", "", nil, nil, nil, fmtStr("target_lang is required")
+			return nil, errors.New("target_lang is required")
 		}
-		targetLang = tl
-
+		p.targetLang = tl
 		if sl, ok := body["source_lang"].(string); ok {
-			sourceLang = sl
+			p.sourceLang = sl
 		}
 
-		// 提取 extra params（标量）
-		extraFields := []string{"formality", "glossary_id", "context", "model_type", "split_sentences", "preserve_formatting", "tag_handling", "outline_detection"}
-		for _, f := range extraFields {
+		for _, f := range scalarExtraFields {
 			if v, ok := body[f].(string); ok {
-				extraParams[f] = v
+				p.extraParams[f] = v
 			}
 		}
-
-		// 提取数组型 tag 参数
-		tagArrayFields := []string{"non_splitting_tags", "splitting_tags", "ignore_tags"}
 		for _, f := range tagArrayFields {
 			if arr, ok := body[f].([]any); ok {
 				for _, item := range arr {
 					if s, ok := item.(string); ok {
-						tagArrayParams[f] = append(tagArrayParams[f], s)
+						p.tagArrayParams[f] = append(p.tagArrayParams[f], s)
 					}
 				}
 			}
 		}
-
-		identity = normalizeJSONIdentity(body)
 	} else {
 		// form-urlencoded
 		if err := c.Request.ParseForm(); err != nil {
-			return nil, "", "", nil, nil, nil, err
+			return nil, err
 		}
 		form := c.Request.PostForm
 
-		texts = form["text"]
-		if len(texts) == 0 {
-			return nil, "", "", nil, nil, nil, fmtStr("text is required")
+		p.texts = form["text"]
+		if len(p.texts) == 0 {
+			return nil, errors.New("text is required")
 		}
 
-		targetLang = form.Get("target_lang")
-		if targetLang == "" {
-			return nil, "", "", nil, nil, nil, fmtStr("target_lang is required")
+		p.targetLang = form.Get("target_lang")
+		if p.targetLang == "" {
+			return nil, errors.New("target_lang is required")
 		}
+		p.sourceLang = form.Get("source_lang")
 
-		sourceLang = form.Get("source_lang")
-
-		extraFields := []string{"formality", "glossary_id", "context", "model_type", "split_sentences", "preserve_formatting", "tag_handling", "outline_detection"}
-		for _, f := range extraFields {
+		for _, f := range scalarExtraFields {
 			if v := form.Get(f); v != "" {
-				extraParams[f] = v
+				p.extraParams[f] = v
 			}
 		}
-
-		// 提取数组型 tag 参数（form 中为重复字段）
-		tagArrayFields := []string{"non_splitting_tags", "splitting_tags", "ignore_tags"}
 		for _, f := range tagArrayFields {
 			if vs := form[f]; len(vs) > 0 {
-				tagArrayParams[f] = vs
+				p.tagArrayParams[f] = vs
 			}
 		}
-
-		identity = normalizeFormIdentity(form)
 	}
 
-	return
+	p.identity = buildIdentity(p)
+	return p, nil
 }
 
-func normalizeJSONIdentity(body map[string]any) *models.CacheIdentity {
-	identity := &models.CacheIdentity{
-		TargetLang: upperOrNull(getStr(body, "target_lang")),
-		SourceLang: upperOrNull(getStr(body, "source_lang")),
-	}
-	switch v := body["text"].(type) {
-	case string:
-		identity.Text = []string{v}
-	case []any:
-		for _, item := range v {
-			identity.Text = append(identity.Text, toString(item))
-		}
-	}
-	identity.Formality = getStr(body, "formality")
-	identity.GlossaryID = getStr(body, "glossary_id")
-	identity.Context = getStr(body, "context")
-	identity.ModelType = getStr(body, "model_type")
-	identity.SplitSentences = getStr(body, "split_sentences")
-	identity.PreserveFormatting = getStr(body, "preserve_formatting")
-	identity.TagHandling = getStr(body, "tag_handling")
-	identity.OutlineDetection = getStr(body, "outline_detection")
-	identity.NonSplittingTags = getStrArr(body, "non_splitting_tags")
-	identity.SplittingTags = getStrArr(body, "splitting_tags")
-	identity.IgnoreTags = getStrArr(body, "ignore_tags")
-	return identity
-}
-
-func normalizeFormIdentity(form url.Values) *models.CacheIdentity {
+// buildIdentity 从已解析的字段直接拼出缓存身份，不再回扫原始请求。
+func buildIdentity(p *translateParams) *models.CacheIdentity {
 	return &models.CacheIdentity{
-		Text:               form["text"],
-		TargetLang:         strings.ToUpper(form.Get("target_lang")),
-		SourceLang:         upperOrNull(form.Get("source_lang")),
-		Formality:          form.Get("formality"),
-		GlossaryID:         form.Get("glossary_id"),
-		Context:            form.Get("context"),
-		ModelType:          form.Get("model_type"),
-		SplitSentences:     form.Get("split_sentences"),
-		PreserveFormatting: form.Get("preserve_formatting"),
-		TagHandling:        form.Get("tag_handling"),
-		OutlineDetection:   form.Get("outline_detection"),
-		NonSplittingTags:   form["non_splitting_tags"],
-		SplittingTags:      form["splitting_tags"],
-		IgnoreTags:         form["ignore_tags"],
+		Text:               p.texts,
+		TargetLang:         strings.ToUpper(p.targetLang),
+		SourceLang:         upperOrNull(p.sourceLang),
+		Formality:          p.extraParams["formality"],
+		GlossaryID:         p.extraParams["glossary_id"],
+		Context:            p.extraParams["context"],
+		ModelType:          p.extraParams["model_type"],
+		SplitSentences:     p.extraParams["split_sentences"],
+		PreserveFormatting: p.extraParams["preserve_formatting"],
+		TagHandling:        p.extraParams["tag_handling"],
+		OutlineDetection:   p.extraParams["outline_detection"],
+
+		CustomInstructions:   p.extraParams["custom_instructions"],
+		TagHandlingVersion:   p.extraParams["tag_handling_version"],
+		ShowBilledCharacters: p.extraParams["show_billed_characters"],
+
+		NonSplittingTags: p.tagArrayParams["non_splitting_tags"],
+		SplittingTags:    p.tagArrayParams["splitting_tags"],
+		IgnoreTags:       p.tagArrayParams["ignore_tags"],
 	}
 }
 
@@ -341,8 +409,9 @@ func handleUsageCompat(cfg *config.Config, kr *service.Keyring) gin.HandlerFunc 
 			return
 		}
 
+		ctx := c.Request.Context()
 		for _, k := range nonOfficial {
-			info, err := provider.DetectProvider(k.Provider).FetchUsage(k.Endpoint, k.AuthKey)
+			info, err := provider.DetectProvider(k.Provider).FetchUsage(ctx, k.Endpoint, k.AuthKey)
 			if err == nil && info.Ok {
 				resp := gin.H{}
 				if info.CharacterCount != nil {
@@ -376,12 +445,6 @@ func writeCacheHeaders(c *gin.Context, headers http.Header, cacheControl, cacheS
 
 func timeNow() string { return time.Now().UTC().Format(time.RFC3339) }
 
-func fmtStr(s string) error { return &strError{s: s} }
-
-type strError struct{ s string }
-
-func (e *strError) Error() string { return e.s }
-
 func toString(v any) string {
 	switch t := v.(type) {
 	case string:
@@ -390,25 +453,6 @@ func toString(v any) string {
 		b, _ := json.Marshal(t)
 		return string(b)
 	}
-}
-
-func getStr(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
-}
-
-func getStrArr(m map[string]any, key string) []string {
-	arr, ok := m[key].([]any)
-	if !ok {
-		return nil
-	}
-	var out []string
-	for _, item := range arr {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 func upperOrNull(s string) string {
