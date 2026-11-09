@@ -172,7 +172,8 @@ Go 服务返回的翻译响应自带 `Cache-Control: public, max-age=86400`。�
 ### 4.1 管理后台
 - 打开：`http://<host>:8080/webui/`
 - 输入 `ADMIN_TOKEN` 登录；
-- 新增 Key 时可选择 Provider（`deepl` / `deeplx`）。
+- 新增 Key 时可选择 Provider（`deepl` / `deeplx`）；
+- 缓存管理仅提供全量列表、分页、译文预览和逐条删除，不提供关键词搜索；`GET /admin/cache` 忽略旧客户端传入的 `search` 参数，`total` 始终为全部缓存条目数（包括尚未清理的过期条目）。
 
 ### 4.2 翻译 API 调用
 

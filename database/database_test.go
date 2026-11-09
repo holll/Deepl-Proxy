@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -12,7 +13,10 @@ import (
 func newTestDB(t *testing.T) (*sql.DB, *sql.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.db")
-	writeDB, readDB := Init(path)
+	writeDB, readDB, err := Init(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = writeDB.Close()
 		_ = readDB.Close()
@@ -31,11 +35,11 @@ func TestCacheRoundTrip(t *testing.T) {
 		CreatedAt:   now,
 		ExpiresAt:   now + 60_000,
 	}
-	if err := UpsertCache(writeDB, want); err != nil {
+	if err := UpsertCache(context.Background(), writeDB, want); err != nil {
 		t.Fatalf("UpsertCache: %v", err)
 	}
 
-	got, err := GetCacheByKey(readDB, want.CacheKey, now)
+	got, err := GetCacheByKey(context.Background(), readDB, want.CacheKey, now)
 	if err != nil {
 		t.Fatalf("GetCacheByKey: %v", err)
 	}
@@ -54,7 +58,7 @@ func TestGetCacheByKeyMissReturnsNil(t *testing.T) {
 	writeDB, readDB := newTestDB(t)
 	_ = writeDB
 
-	got, err := GetCacheByKey(readDB, "does-not-exist", time.Now().UnixMilli())
+	got, err := GetCacheByKey(context.Background(), readDB, "does-not-exist", time.Now().UnixMilli())
 	if err != nil {
 		t.Fatalf("miss should not be an error: %v", err)
 	}
@@ -72,11 +76,11 @@ func TestGetCacheByKeyHidesExpiredRows(t *testing.T) {
 		CacheKey: "k-expired", Body: []byte("x"), HeadersJSON: "{}",
 		CreatedAt: now - 10_000, ExpiresAt: now - 1,
 	}
-	if err := UpsertCache(writeDB, row); err != nil {
+	if err := UpsertCache(context.Background(), writeDB, row); err != nil {
 		t.Fatalf("UpsertCache: %v", err)
 	}
 
-	got, err := GetCacheByKey(readDB, row.CacheKey, now)
+	got, err := GetCacheByKey(context.Background(), readDB, row.CacheKey, now)
 	if err != nil {
 		t.Fatalf("GetCacheByKey: %v", err)
 	}
@@ -94,18 +98,18 @@ func TestUpsertPreservesCreatedAt(t *testing.T) {
 		CacheKey: "k-created", Body: []byte("v1"), HeadersJSON: "{}",
 		CreatedAt: first, ExpiresAt: first + 60_000,
 	}
-	if err := UpsertCache(writeDB, row); err != nil {
+	if err := UpsertCache(context.Background(), writeDB, row); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
 
 	row.Body = []byte("v2")
 	row.CreatedAt = first + 5_000
 	row.ExpiresAt = first + 120_000
-	if err := UpsertCache(writeDB, row); err != nil {
+	if err := UpsertCache(context.Background(), writeDB, row); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
 
-	got, err := GetCacheByKey(readDB, row.CacheKey, first)
+	got, err := GetCacheByKey(context.Background(), readDB, row.CacheKey, first)
 	if err != nil || got == nil {
 		t.Fatalf("GetCacheByKey: %v (row=%v)", err, got)
 	}
@@ -128,12 +132,12 @@ func TestCompareAndRenewCache(t *testing.T) {
 		CacheKey: "k-cas", Body: []byte("x"), HeadersJSON: "{}",
 		CreatedAt: now, ExpiresAt: now + 1_000,
 	}
-	if err := UpsertCache(writeDB, row); err != nil {
+	if err := UpsertCache(context.Background(), writeDB, row); err != nil {
 		t.Fatalf("UpsertCache: %v", err)
 	}
 
 	// 旧值不匹配 → 不更新
-	ok, err := CompareAndRenewCache(writeDB, row.CacheKey, now+999, now+9_000)
+	ok, err := CompareAndRenewCache(context.Background(), writeDB, row.CacheKey, now+999, now+9_000)
 	if err != nil {
 		t.Fatalf("renew with stale value: %v", err)
 	}
@@ -142,7 +146,7 @@ func TestCompareAndRenewCache(t *testing.T) {
 	}
 
 	// 旧值匹配 → 更新成功
-	ok, err = CompareAndRenewCache(writeDB, row.CacheKey, now+1_000, now+9_000)
+	ok, err = CompareAndRenewCache(context.Background(), writeDB, row.CacheKey, now+1_000, now+9_000)
 	if err != nil {
 		t.Fatalf("renew: %v", err)
 	}
@@ -150,7 +154,7 @@ func TestCompareAndRenewCache(t *testing.T) {
 		t.Fatal("CAS failed to renew with the matching expires_at")
 	}
 
-	got, err := GetCacheByKey(readDB, row.CacheKey, now)
+	got, err := GetCacheByKey(context.Background(), readDB, row.CacheKey, now)
 	if err != nil || got == nil {
 		t.Fatalf("GetCacheByKey: %v", err)
 	}
@@ -159,7 +163,7 @@ func TestCompareAndRenewCache(t *testing.T) {
 	}
 
 	// 同一个旧值不能二次生效，说明并发命中只有一个能续期
-	ok, err = CompareAndRenewCache(writeDB, row.CacheKey, now+1_000, now+99_000)
+	ok, err = CompareAndRenewCache(context.Background(), writeDB, row.CacheKey, now+1_000, now+99_000)
 	if err != nil {
 		t.Fatalf("second renew: %v", err)
 	}
@@ -177,17 +181,17 @@ func TestCleanExpiredCache(t *testing.T) {
 			CacheKey: "k-clean-" + string(rune('a'+i)), Body: []byte("x"), HeadersJSON: "{}",
 			CreatedAt: now - 1_000, ExpiresAt: expiresAt,
 		}
-		if err := UpsertCache(writeDB, row); err != nil {
+		if err := UpsertCache(context.Background(), writeDB, row); err != nil {
 			t.Fatalf("UpsertCache: %v", err)
 		}
 	}
 
-	if err := CleanExpiredCache(writeDB, 500, 20); err != nil {
+	if err := CleanExpiredCache(context.Background(), writeDB, 500, 20); err != nil {
 		t.Fatalf("CleanExpiredCache: %v", err)
 	}
 
 	var remaining int
-	row, err := queryRow(readDB, "SELECT COUNT(*) FROM deepl_translation_cache")
+	row, err := queryRow(context.Background(), readDB, "SELECT COUNT(*) FROM deepl_translation_cache")
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
@@ -198,7 +202,7 @@ func TestCleanExpiredCache(t *testing.T) {
 		t.Fatalf("remaining = %d, want 1 (only the unexpired row)", remaining)
 	}
 
-	got, err := GetCacheByKey(readDB, "k-clean-d", now)
+	got, err := GetCacheByKey(context.Background(), readDB, "k-clean-d", now)
 	if err != nil || got == nil {
 		t.Fatal("cleanup deleted the unexpired row")
 	}
@@ -207,12 +211,12 @@ func TestCleanExpiredCache(t *testing.T) {
 func TestKeyLifecycle(t *testing.T) {
 	writeDB, readDB := newTestDB(t)
 
-	id, err := InsertKey(writeDB, "test", "secret", "https://api.deepl.com", "deepl")
+	id, err := InsertKey(context.Background(), writeDB, "test", "secret", "https://api.deepl.com", "deepl")
 	if err != nil {
 		t.Fatalf("InsertKey: %v", err)
 	}
 
-	keys, err := GetActiveKeys(readDB)
+	keys, err := GetActiveKeys(context.Background(), readDB)
 	if err != nil {
 		t.Fatalf("GetActiveKeys: %v", err)
 	}
@@ -222,10 +226,10 @@ func TestKeyLifecycle(t *testing.T) {
 
 	// 停用后不应出现在可用列表里
 	disabled := "disabled"
-	if err := UpdateKey(writeDB, id, nil, nil, nil, nil, &disabled); err != nil {
+	if err := UpdateKey(context.Background(), writeDB, id, nil, nil, nil, nil, &disabled); err != nil {
 		t.Fatalf("UpdateKey: %v", err)
 	}
-	keys, err = GetActiveKeys(readDB)
+	keys, err = GetActiveKeys(context.Background(), readDB)
 	if err != nil {
 		t.Fatalf("GetActiveKeys: %v", err)
 	}
@@ -233,10 +237,10 @@ func TestKeyLifecycle(t *testing.T) {
 		t.Fatalf("disabled key is still active: %+v", keys)
 	}
 
-	if err := DeleteKey(writeDB, id); err != nil {
+	if err := DeleteKey(context.Background(), writeDB, id); err != nil {
 		t.Fatalf("DeleteKey: %v", err)
 	}
-	keys, _ = GetAllKeys(readDB)
+	keys, _ = GetAllKeys(context.Background(), readDB)
 	if len(keys) != 0 {
 		t.Fatalf("key was not deleted: %+v", keys)
 	}

@@ -30,7 +30,7 @@ type DeeplKey struct {
 // TranslateCache 翻译缓存。
 // Body 用 []byte 而不是 string：命中路径上直接交给 c.Data 写出，
 // 避免 string→[]byte 的整份拷贝（string 无法与 []byte 共享底层数组）。
-// 写库时由 database.UpsertCache 转回 TEXT，保证管理端 LIKE 查询仍然可用。
+// 写库时由 database.UpsertCache 转回 TEXT，保持既有缓存存储格式。
 type TranslateCache struct {
 	CacheKey    string `json:"cache_key"`
 	Body        []byte `json:"-"`

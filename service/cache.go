@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -206,16 +207,17 @@ func upperTrim(s string) string { return strings.ToUpper(strings.TrimSpace(s)) }
 // text 条数，仅用于校验旧行是否可信 —— 旧键不含 provider 维度，
 // 而 deeplx 产出的行恒定只有 1 条 translation：若把这样的行回放给
 // 需要 N 条译文的请求，就是一次结构错误的响应。条数对不上就当作未命中。
-func (cs *CacheService) Get(cacheKey, legacyKey string, wantTexts int) (*CachedHit, error) {
+func (cs *CacheService) Get(ctx context.Context, cacheKey, legacyKey string, wantTexts int) (*CachedHit, error) {
 	// ttl<=0 表示禁用缓存：读取也必须关闭，否则旧的未过期行会被继续返回并续期，
 	// 出现"配置说不缓存、实际却在缓存"的语义分裂。
 	if cs.ttl <= 0 {
 		return nil, nil
 	}
-
+	ctx, cancel := context.WithTimeout(ctx, database.CacheTimeout)
+	defer cancel()
 	now := time.Now().UnixMilli()
 
-	c, err := database.GetCacheByKey(cs.readDB, cacheKey, now)
+	c, err := database.GetCacheByKey(ctx, cs.readDB, cacheKey, now)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +226,7 @@ func (cs *CacheService) Get(cacheKey, legacyKey string, wantTexts int) (*CachedH
 		if c.ExpiresAt-now < ttlMs/2 {
 			// 滑窗续期：CAS 到读到的那个 expires_at，并发命中只有一写成功，
 			// 避免 N 次串行 UPDATE 挤占唯一写连接。
-			if _, err := database.CompareAndRenewCache(cs.writeDB, cacheKey, c.ExpiresAt, now+ttlMs); err != nil {
+			if _, err := database.CompareAndRenewCache(ctx, cs.writeDB, cacheKey, c.ExpiresAt, now+ttlMs); err != nil {
 				log.Printf("[cache] renew failed: %v", err)
 			}
 		}
@@ -232,16 +234,16 @@ func (cs *CacheService) Get(cacheKey, legacyKey string, wantTexts int) (*CachedH
 	}
 
 	// 新键未命中，再按 v1 键查一次（迁移期内）。
-	return cs.getLegacy(cacheKey, legacyKey, wantTexts, now)
+	return cs.getLegacy(ctx, cacheKey, legacyKey, wantTexts, now)
 }
 
 // getLegacy 处理 v1 旧行的兼容读取与就地迁移。
-func (cs *CacheService) getLegacy(cacheKey, legacyKey string, wantTexts int, now int64) (*CachedHit, error) {
+func (cs *CacheService) getLegacy(ctx context.Context, cacheKey, legacyKey string, wantTexts int, now int64) (*CachedHit, error) {
 	if !cs.legacyFallback || legacyKey == "" || legacyKey == cacheKey {
 		return nil, nil
 	}
 
-	c, err := database.GetCacheByKey(cs.readDB, legacyKey, now)
+	c, err := database.GetCacheByKey(ctx, cs.readDB, legacyKey, now)
 	if err != nil || c == nil {
 		return nil, err
 	}
@@ -260,7 +262,7 @@ func (cs *CacheService) getLegacy(cacheKey, legacyKey string, wantTexts int, now
 	// 就地迁移：写一份到新键，之后同一请求直接走新键。
 	// 旧行不删除、也不续期 —— 保留它是为了回滚时旧二进制仍能命中，
 	// 它会按自己的 expires_at 被后台清理回收，不会长期双份占用。
-	cs.Put(cacheKey, c.Body, hit.Headers)
+	cs.Put(ctx, cacheKey, c.Body, hit.Headers)
 	log.Printf("[cache] migrated legacy entry to key %s", cacheKey)
 
 	return hit, nil
@@ -303,7 +305,7 @@ func decodeCachedHeaders(raw string) http.Header {
 // ========================
 //
 
-func (cs *CacheService) Put(cacheKey string, body []byte, upstreamHeaders http.Header) {
+func (cs *CacheService) Put(ctx context.Context, cacheKey string, body []byte, upstreamHeaders http.Header) {
 	if cs.ttl <= 0 {
 		return
 	}
@@ -318,7 +320,7 @@ func (cs *CacheService) Put(cacheKey string, body []byte, upstreamHeaders http.H
 	// 不必再复制一份 map。
 	headersJSON, _ := json.Marshal(clean)
 
-	err := database.UpsertCache(cs.writeDB, &models.TranslateCache{
+	err := database.UpsertCache(ctx, cs.writeDB, &models.TranslateCache{
 		CacheKey:    cacheKey,
 		Body:        body,
 		HeadersJSON: string(headersJSON),
@@ -336,8 +338,9 @@ func (cs *CacheService) Put(cacheKey string, body []byte, upstreamHeaders http.H
 // ========================
 //
 
-func (cs *CacheService) CleanExpired() {
+func (cs *CacheService) CleanExpired(ctx context.Context) {
 	if err := database.CleanExpiredCache(
+		ctx,
 		cs.writeDB,
 		cs.cfg.Cache.CleanupBatchSize,
 		cs.cfg.Cache.CleanupMaxRounds,

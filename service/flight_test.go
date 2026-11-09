@@ -226,3 +226,126 @@ func TestFlightPanicReleasesWaiters(t *testing.T) {
 		t.Fatalf("panic must not leak an in-flight entry, has %d", n)
 	}
 }
+
+func waitForWaiters(t *testing.T, f *Flight[string], n int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		c := f.m["k"]
+		ready := c != nil && c.waiters == n
+		f.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("waiters did not register")
+}
+
+func TestFlightLeaderCancellationDoesNotCancelOtherWaiter(t *testing.T) {
+	f := NewFlight[string]()
+	leader, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, _, err := f.Do(leader, "k", func(ctx context.Context) (string, error) {
+			close(entered)
+			select {
+			case <-release:
+				return "ok", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		})
+		leaderDone <- err
+	}()
+	<-entered
+	result := make(chan string, 1)
+	go func() {
+		v, _, err := f.Do(context.Background(), "k", func(context.Context) (string, error) { return "wrong", nil })
+		if err != nil {
+			result <- err.Error()
+		} else {
+			result <- v
+		}
+	}()
+	waitForWaiters(t, f, 2)
+	cancel()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader: %v", err)
+	}
+	close(release)
+	if got := <-result; got != "ok" {
+		t.Fatalf("remaining waiter: %q", got)
+	}
+}
+
+func TestFlightAllWaitersCancelWork(t *testing.T) {
+	f := NewFlight[string]()
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = f.Do(ctx, "k", func(work context.Context) (string, error) {
+			close(entered)
+			<-work.Done()
+			close(stopped)
+			return "", work.Err()
+		})
+	}()
+	<-entered
+	cancel()
+	<-done
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("orphan shared work")
+	}
+}
+
+func TestFlightLifecycleCancellation(t *testing.T) {
+	root, stop := context.WithCancel(context.Background())
+	defer stop()
+	f := NewFlight[string](root)
+	entered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := f.Do(context.Background(), "k", func(ctx context.Context) (string, error) { close(entered); <-ctx.Done(); return "", ctx.Err() })
+		done <- err
+	}()
+	<-entered
+	stop()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle not canceled")
+	}
+}
+
+func TestFlightCapacityIsBounded(t *testing.T) {
+	f := NewFlight[string]()
+	f.slots = make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = f.Do(ctx, "k", func(work context.Context) (string, error) { close(entered); <-work.Done(); return "", work.Err() })
+	}()
+	<-entered
+	ran := false
+	_, _, err := f.Do(context.Background(), "other", func(context.Context) (string, error) { ran = true; return "", nil })
+	if err == nil || ran {
+		t.Fatal("capacity should reject additional workers")
+	}
+	cancel()
+	<-done
+}

@@ -61,7 +61,7 @@ func handleAdminSession(cfg *config.Config) gin.HandlerFunc {
 
 func handleAdminKeys(kr *service.Keyring) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		keys, err := database.GetAllKeys(kr.DB())
+		keys, err := database.GetAllKeys(c.Request.Context(), kr.DB())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -89,7 +89,7 @@ func handleAdminKeyCreate(kr *service.Keyring) gin.HandlerFunc {
 		// cmp.Or 取第一个非零值，等价于 "空则默认 deepl"。
 		body.Provider = cmp.Or(body.Provider, "deepl")
 
-		id, err := kr.AddKey(body.Name, body.AuthKey, body.Endpoint, body.Provider)
+		id, err := kr.AddKey(c.Request.Context(), body.Name, body.AuthKey, body.Endpoint, body.Provider)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -114,6 +114,7 @@ func handleAdminKeyUpdate(kr *service.Keyring) gin.HandlerFunc {
 		}
 
 		err = kr.UpdateKeyByID(
+			c.Request.Context(),
 			id,
 			nullableStrBody(body, "name"),
 			nullableStrBody(body, "auth_key"),
@@ -137,7 +138,7 @@ func handleAdminKeyDelete(kr *service.Keyring) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id"})
 			return
 		}
-		if err := kr.DeleteKeyByID(id); err != nil {
+		if err := kr.DeleteKeyByID(c.Request.Context(), id); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -156,7 +157,7 @@ func handleUsageRefresh(kr *service.Keyring) gin.HandlerFunc {
 
 func handleCacheList(kr *service.Keyring) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		search := c.Query("search")
+		// 缓存搜索已禁用；旧客户端传入的 search 参数不再参与查询。
 		limit := 50
 		offset := 0
 		if v := c.Query("limit"); v != "" {
@@ -170,7 +171,7 @@ func handleCacheList(kr *service.Keyring) gin.HandlerFunc {
 			}
 		}
 
-		entries, total, err := database.ListCacheEntries(kr.DB(), search, limit, offset)
+		entries, total, err := database.ListCacheEntries(c.Request.Context(), kr.DB(), limit, offset)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -215,7 +216,7 @@ func handleCacheDelete(kr *service.Keyring) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "key query param required"})
 			return
 		}
-		if err := database.DeleteCacheByKey(kr.WriteDB(), key); err != nil {
+		if err := database.DeleteCacheByKey(c.Request.Context(), kr.WriteDB(), key); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}

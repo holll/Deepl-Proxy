@@ -55,7 +55,7 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 	//
 	// flight 提到路由层共享：/v2/translate 与 /translate 是同一条业务路径，
 	// 共用一份合并表才能让两个入口的并发请求也合并成一次上游调用。
-	flight := service.NewFlight[upstreamOutcome]()
+	flight := service.NewFlight[upstreamOutcome](kr.Context())
 
 	translate := r.Group("")
 	translate.Use(GatewayAuthMiddleware(cfg))
@@ -91,7 +91,7 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 		// 顺序很关键：缓存键里带 provider 类别，而类别取决于本次可用的 key
 		// 和请求形状。先查缓存就必须先猜一个类别——这正是旧实现
 		// "deeplx 的单条译文被当作 deepl 的三条译文回放"的根因。
-		keys, err := kr.GetActiveKeys()
+		keys, err := kr.GetActiveKeys(c.Request.Context())
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Failed to get keys"})
 			return
@@ -129,7 +129,7 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 				parsed.identity.ShowBilledCharacters == "" {
 				legacyKey = service.BuildLegacyCacheKey(parsed.identity)
 			}
-			if hit, err := cs.Get(cacheKey, legacyKey, len(parsed.texts)); err == nil && hit != nil {
+			if hit, err := cs.Get(c.Request.Context(), cacheKey, legacyKey, len(parsed.texts)); err == nil && hit != nil {
 				writeCacheHeaders(c, hit.Headers, cs.CacheControlHeader(), "HIT")
 				// hit.Body 已经是 []byte，直接写，不再 string→[]byte 复制一次。
 				c.Data(http.StatusOK, "application/json; charset=utf-8", hit.Body)
@@ -168,7 +168,7 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 			IgnoreTags:       parsed.tagArrayParams["ignore_tags"],
 		}
 
-		// 上游调用：ctx 一路传到 http，客户端断开即取消付费的上游请求。
+		// ctx 一路传到 HTTP；共享调用仅在所有等待者离开或生命周期结束时取消。
 		callUpstream := func(ctx context.Context) upstreamOutcome {
 			result, usedKey, failure, translateErr := kr.Translate(ctx, sel, req)
 			return upstreamOutcome{result: result, usedKey: usedKey, failure: failure, err: translateErr}
@@ -184,11 +184,11 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 			out = callUpstream(c.Request.Context())
 		} else {
 			v, _, flightErr := flight.Do(c.Request.Context(), cacheKey,
-				func(leaderCtx context.Context) (upstreamOutcome, error) {
-					o := callUpstream(leaderCtx)
-					// 只有 leader 会执行到这里，因此缓存写入天然只发生一次。
+				func(workCtx context.Context) (upstreamOutcome, error) {
+					o := callUpstream(workCtx)
+					// 共享 worker 只执行一次，缓存写入失败不影响成功的翻译。
 					if o.result != nil && o.result.StatusCode == http.StatusOK {
-						cs.Put(cacheKey, o.result.Body, buildResponseHeaders(o.result, o.usedKey))
+						cs.Put(workCtx, cacheKey, o.result.Body, buildResponseHeaders(o.result, o.usedKey))
 					}
 					return o, nil
 				})
@@ -388,7 +388,7 @@ func buildIdentity(p *translateParams) *models.CacheIdentity {
 
 func handleUsageCompat(cfg *config.Config, kr *service.Keyring) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		keys, err := kr.GetActiveKeys()
+		keys, err := kr.GetActiveKeys(c.Request.Context())
 		if err != nil || len(keys) == 0 {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "No available keys"})
 			return

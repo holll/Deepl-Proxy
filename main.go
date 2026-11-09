@@ -46,8 +46,16 @@ func run() error {
 
 	log.Printf("DeepL Proxy %s (commit %s, built %s)", Version, Commit, BuildTime)
 
+	// 应用级 ctx：收到信号或 server 出错时统一取消所有后台 goroutine，
+	// 让它们有机会退出而不是变成进程级孤儿。
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// 初始化数据库
-	writeDB, readDB := database.Init(cfg.Database.Path)
+	writeDB, readDB, err := database.Init(ctx, cfg.Database.Path)
+	if err != nil {
+		return err
+	}
 	defer func() {
 		if err := writeDB.Close(); err != nil {
 			log.Printf("close write db: %v", err)
@@ -58,13 +66,9 @@ func run() error {
 	}()
 
 	// 初始化服务
-	kr := service.NewKeyring(writeDB, readDB)
+	kr := service.NewKeyring(ctx, writeDB, readDB)
+	defer kr.Close()
 	cs := service.NewCacheService(writeDB, readDB, cfg)
-
-	// 应用级 ctx：收到信号或 server 出错时统一取消所有后台 goroutine，
-	// 让它们有机会退出而不是变成进程级孤儿。
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	var wg sync.WaitGroup
 
@@ -124,6 +128,7 @@ func run() error {
 		log.Printf("listen error: %v", err)
 	}
 
+	stop() // Cancel lifecycle work also when ListenAndServe fails.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -148,7 +153,7 @@ func runCacheCleanup(ctx context.Context, cs *service.CacheService, cfg *config.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cs.CleanExpired()
+			cs.CleanExpired(ctx)
 		}
 	}
 }

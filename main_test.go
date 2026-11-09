@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -113,7 +114,10 @@ func newHarnessWith(t *testing.T, ttlDays int, mutate func(*config.Config)) *har
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	writeDB, readDB := database.Init(dbPath)
+	writeDB, readDB, err := database.Init(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = writeDB.Close()
 		_ = readDB.Close()
@@ -129,7 +133,8 @@ func newHarnessWith(t *testing.T, ttlDays int, mutate func(*config.Config)) *har
 		mutate(cfg)
 	}
 
-	kr := service.NewKeyring(writeDB, readDB)
+	kr := service.NewKeyring(t.Context(), writeDB, readDB)
+	t.Cleanup(kr.Close)
 	cs := service.NewCacheService(writeDB, readDB, cfg)
 
 	r := gin.New()
@@ -480,7 +485,7 @@ func TestZeroTTLDisablesCacheEntirely(t *testing.T) {
 			TargetLang: "ZH",
 		}, "deepl")
 		now := time.Now().UnixMilli()
-		if err := database.UpsertCache(h.writeDB, &models.TranslateCache{
+		if err := database.UpsertCache(context.Background(), h.writeDB, &models.TranslateCache{
 			CacheKey:    key,
 			Body:        []byte(`{"translations":[{"text":"seeded"}]}`),
 			HeadersJSON: "{}",
@@ -588,7 +593,7 @@ func seedLegacyRow(t *testing.T, h *harness, identity *models.CacheIdentity, bod
 		t.Fatal("legacy key is empty")
 	}
 	now := time.Now().UnixMilli()
-	if err := database.UpsertCache(h.writeDB, &models.TranslateCache{
+	if err := database.UpsertCache(context.Background(), h.writeDB, &models.TranslateCache{
 		CacheKey:    key,
 		Body:        []byte(body),
 		HeadersJSON: `{"Content-Type":["application/json"]}`,
