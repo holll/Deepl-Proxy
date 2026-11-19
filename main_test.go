@@ -124,7 +124,7 @@ func newHarnessWith(t *testing.T, ttlDays int, mutate func(*config.Config)) *har
 	})
 
 	cfg := &config.Config{
-		Server:   config.ServerConfig{Port: "0", AllowOrigin: "*"},
+		Server:   config.ServerConfig{Port: "8080", AllowOrigin: "*"},
 		Auth:     config.AuthConfig{AdminToken: testAdminToken, GatewayToken: testGatewayToken, AdminCookieSecret: "0123456789abcdef0123456789abcdef", SessionTTL: 3600},
 		Database: config.DatabaseConfig{Path: dbPath},
 		Cache:    config.CacheConfig{TTLDays: ttlDays, CleanupInterval: 3600, CleanupBatchSize: 500, CleanupMaxRounds: 20},
@@ -136,13 +136,19 @@ func newHarnessWith(t *testing.T, ttlDays int, mutate func(*config.Config)) *har
 	kr := service.NewKeyring(t.Context(), writeDB, readDB)
 	t.Cleanup(kr.Close)
 	cs := service.NewCacheService(writeDB, readDB, cfg)
+	settings, err := service.NewSettings(t.Context(), writeDB, cfg)
+	if err != nil {
+		t.Fatalf("NewSettings: %v", err)
+	}
+	notifier := service.NewWebhookManager(t.Context(), settings)
+	t.Cleanup(notifier.Close)
 
 	r := gin.New()
 	if err := r.SetTrustedProxies([]string{"127.0.0.1"}); err != nil {
 		t.Fatalf("SetTrustedProxies: %v", err)
 	}
 	r.Use(gin.Recovery())
-	handler.SetupRoutes(r, kr, cs, cfg)
+	handler.SetupRoutes(r, kr, cs, settings, settings, notifier)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
@@ -293,6 +299,39 @@ func assertCacheStatus(t *testing.T, hdr http.Header, want string) {
 	if got := hdr.Get("X-Cache-Status"); got != want {
 		t.Fatalf("X-Cache-Status = %q, want %q", got, want)
 	}
+}
+
+func TestAdminKeySecretRequiresAdminAndIsNotInList(t *testing.T) {
+	h := newHarness(t, 1)
+	id := h.addKey("demo", "deepl")
+	path := fmt.Sprintf("/admin/keys/%d/secret", id)
+	status, _, body := h.do(http.MethodGet, path, "", nil, nil)
+	assertStatus(t, status, http.StatusUnauthorized, body)
+	status, _, body = h.do(http.MethodGet, path, "", nil, map[string]string{"Authorization": "Bearer " + testGatewayToken})
+	assertStatus(t, status, http.StatusUnauthorized, body)
+
+	login, hdr, body := h.do(http.MethodPost, "/admin/login", "application/json", []byte(`{"admin_token":"`+testAdminToken+`"}`), nil)
+	assertStatus(t, login, http.StatusOK, body)
+	cookie := strings.SplitN(hdr.Get("Set-Cookie"), ";", 2)[0]
+	status, hdr, body = h.do(http.MethodGet, path, "", nil, map[string]string{"Cookie": cookie})
+	assertStatus(t, status, http.StatusOK, body)
+	if hdr.Get("Cache-Control") != "no-store" {
+		t.Fatal("secret response must not be cached")
+	}
+	var response map[string]string
+	if err := json.Unmarshal(body, &response); err != nil || len(response) != 1 || response["auth_key"] != "key-demo" {
+		t.Fatalf("unexpected secret response: %s (%v)", body, err)
+	}
+	status, body = h.admin(http.MethodGet, "/admin/keys", nil)
+	assertStatus(t, status, http.StatusOK, body)
+	if bytes.Contains(body, []byte(`"auth_key"`)) || bytes.Contains(body, []byte("key-demo")) {
+		t.Fatal("Key list exposes the full secret")
+	}
+
+	status, body = h.admin(http.MethodGet, "/admin/keys/0/secret", nil)
+	assertStatus(t, status, http.StatusBadRequest, body)
+	status, body = h.admin(http.MethodGet, fmt.Sprintf("/admin/keys/%d/secret", id+1), nil)
+	assertStatus(t, status, http.StatusNotFound, body)
 }
 
 // --- 缓存键与 provider 路由 ---

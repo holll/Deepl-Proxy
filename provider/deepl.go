@@ -63,6 +63,10 @@ func (d *DeepL) FetchUsage(ctx context.Context, endpoint, authKey string) (*Usag
 		return nil, fmt.Errorf("deepl usage read: %w", err)
 	}
 	bodyStr := string(body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// 限流响应不一定是 JSON，仍应让手动用量刷新处理状态码和冷却时间。
+		return &UsageInfo{Status: resp.StatusCode, Text: bodyStr, RetryAfter: resp.Header.Get("Retry-After")}, nil
+	}
 
 	info, parseErr := parseUsageResponse(body)
 	// 非 200 响应（如 403）body 通常不是 JSON，parseErr != nil 且 info == nil，

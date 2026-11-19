@@ -99,8 +99,9 @@ func RequestLogger() gin.HandlerFunc {
 }
 
 // CORSMiddleware 处理 CORS
-func CORSMiddleware(cfg *config.Config) gin.HandlerFunc {
+func CORSMiddleware(src ConfigSource) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		cfg := src.Get()
 		origin := c.Request.Header.Get("Origin")
 		allowOrigin := cfg.Server.AllowOrigin
 
@@ -124,8 +125,9 @@ func CORSMiddleware(cfg *config.Config) gin.HandlerFunc {
 }
 
 // GatewayAuthMiddleware 验证网关 GATEWAY_TOKEN
-func GatewayAuthMiddleware(cfg *config.Config) gin.HandlerFunc {
+func GatewayAuthMiddleware(src ConfigSource) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		cfg := src.Get()
 		if cfg.Auth.GatewayToken == "" {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "GATEWAY_TOKEN is not configured"})
 			return
@@ -142,8 +144,9 @@ func GatewayAuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 }
 
 // AdminAuthMiddleware 验证管理员身份（支持 Bearer token + Cookie session）
-func AdminAuthMiddleware(cfg *config.Config) gin.HandlerFunc {
+func AdminAuthMiddleware(src ConfigSource) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		cfg := src.Get()
 		if cfg.Auth.AdminToken == "" {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "ADMIN_TOKEN is not configured"})
 			return

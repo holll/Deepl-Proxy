@@ -67,7 +67,7 @@ func TestCanceledDatabaseOperations(t *testing.T) {
 	cancel()
 	tests := map[string]func() error{
 		"keys":       func() error { _, err := GetActiveKeys(ctx, db); return err },
-		"key update": func() error { return UpdateKey(ctx, db, 1, nil, nil, nil, nil, nil) },
+		"key update": func() error { return UpdateKey(ctx, db, 1, nil, nil, nil, nil, nil, nil) },
 		"disable":    func() error { return DisableKeyPermanent(ctx, db, 1, "", "", 1) },
 		"usage":      func() error { return UpdateUsageSnapshot(ctx, db, 1, nil, nil, 1) },
 		"cache read": func() error { _, err := GetCacheByKey(ctx, db, "k", 1); return err },

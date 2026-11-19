@@ -33,6 +33,7 @@ type UsageInfo struct {
 	Ok             bool
 	Status         int
 	Text           string
+	RetryAfter     string `json:"-"`
 }
 
 // TranslateRequest 归一化的翻译请求
@@ -95,6 +96,10 @@ func parseUsageResponse(body []byte) (*UsageInfo, error) {
 
 // ClassifyError 根据状态码和响应体分类错误类型
 func ClassifyError(statusCode int, body, siteType string) string {
+	// 明确的限流状态优先于响应正文的配额关键词。
+	if statusCode == http.StatusTooManyRequests {
+		return "temporary"
+	}
 	content := strings.ToLower(body)
 	if statusCode == 456 || strings.Contains(content, "quota exceeded") || strings.Contains(content, "character quota") {
 		if siteType == "deepl_pro" || siteType == "deeplx" {
@@ -103,7 +108,7 @@ func ClassifyError(statusCode int, body, siteType string) string {
 		return "monthly"
 	}
 	switch statusCode {
-	case 429, 500, 502, 503, 504:
+	case 500, 502, 503, 504:
 		return "temporary"
 	case 401, 403:
 		return "permanent"

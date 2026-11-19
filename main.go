@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"flag"
 	"io/fs"
 	"log"
 	"net/http"
@@ -32,6 +33,18 @@ var (
 )
 
 func main() {
+	// 子命令：不启动服务，直接重置数据库里的管理员令牌。
+	if len(os.Args) > 1 && os.Args[1] == "reset-admin" {
+		if err := resetAdminCommand(os.Args[2:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			log.Printf("reset-admin: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// 把真正的逻辑放进 run() 返回 error：这样数据库关闭等 defer 一定会执行。
 	// 旧实现在 ListenAndServe 的 goroutine 里直接 log.Fatalf，进程被强制退出，
 	// 所有 defer（含 DB 关闭）全部跳过。
@@ -42,9 +55,16 @@ func main() {
 }
 
 func run() error {
-	cfg := config.Load()
+	cfg, err := config.LoadFrom(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // -h/--help 已经把用法打印出来了
+		}
+		return err
+	}
 
 	log.Printf("DeepL Proxy %s (commit %s, built %s)", Version, Commit, BuildTime)
+	log.Printf("数据库: %s（来源：%s）", cfg.Database.Path, cfg.Database.Source)
 
 	// 应用级 ctx：收到信号或 server 出错时统一取消所有后台 goroutine，
 	// 让它们有机会退出而不是变成进程级孤儿。
@@ -65,18 +85,34 @@ func run() error {
 		}
 	}()
 
+	// 运行期设置：数据库为唯一来源（首次启动会把旧的 config.yaml 迁进来）。
+	settings, err := service.NewSettings(ctx, writeDB, cfg)
+	if err != nil {
+		return err
+	}
+
 	// 初始化服务
 	kr := service.NewKeyring(ctx, writeDB, readDB)
 	defer kr.Close()
-	cs := service.NewCacheService(writeDB, readDB, cfg)
+	// 缓存参数在构造时快照；后台修改缓存设置后提示“重启生效”。
+	cs := service.NewCacheService(writeDB, readDB, settings.Get())
+
+	// webhook 通知（key 失效 / 配额用尽 / 无可用 key）。
+	// 未配置时是空对象，所有调用都是 no-op，不会给主链路带来分支成本。
+	notifier := service.NewWebhookManager(ctx, settings)
+	kr.SetNotifier(notifier.Notifier())
+	defer notifier.Close()
 
 	var wg sync.WaitGroup
 
 	// 启动时查询所有 key 的用量
 	wg.Go(func() { kr.RefreshAllUsage(ctx) })
 
+	// 定时恢复已到期的 Key，并在关闭数据库前等待任务退出。
+	wg.Go(func() { kr.RunKeyRecovery(ctx) })
+
 	// 定时缓存清理
-	wg.Go(func() { runCacheCleanup(ctx, cs, cfg) })
+	wg.Go(func() { runCacheCleanup(ctx, cs, settings) })
 
 	// 初始化 Gin
 	gin.SetMode(gin.ReleaseMode)
@@ -96,10 +132,10 @@ func run() error {
 	}
 
 	// 路由注册
-	handler.SetupRoutes(r, kr, cs, cfg)
+	handler.SetupRoutes(r, kr, cs, settings, settings, notifier)
 
 	// 启动 HTTP server
-	addr := ":" + cfg.Server.Port
+	addr := ":" + settings.Get().Server.Port
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: r,
@@ -140,8 +176,11 @@ func run() error {
 }
 
 // runCacheCleanup 按配置间隔清理过期缓存，ctx 取消即退出。
-func runCacheCleanup(ctx context.Context, cs *service.CacheService, cfg *config.Config) {
-	interval := time.Duration(cfg.Cache.CleanupInterval) * time.Second
+//
+// 间隔在启动时读取一次：后台修改清理参数后需要重启才会应用，
+// 响应里通过 restart_required_for 明确告知。
+func runCacheCleanup(ctx context.Context, cs *service.CacheService, settings *service.Settings) {
+	interval := time.Duration(settings.Get().Cache.CleanupInterval) * time.Second
 	if interval <= 0 {
 		interval = time.Hour
 	}

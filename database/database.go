@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,13 +117,59 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			expires_at  INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_translation_cache_expires_at ON deepl_translation_cache(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("migration: %w", err)
 		}
 	}
+
+	// 增量列：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列，
+	// 因此新增字段必须显式做一次"缺列才加"的迁移。
+	if err := ensureColumn(ctx, db, "deepl_keys", "quota_period",
+		"ALTER TABLE deepl_keys ADD COLUMN quota_period TEXT NOT NULL DEFAULT 'auto'"); err != nil {
+		return fmt.Errorf("migration quota_period: %w", err)
+	}
 	return nil
+}
+
+// ensureColumn 在列不存在时执行 ddl。
+//
+// 不能靠"执行失败就忽略"来判断：真正的迁移错误（磁盘满、库只读）
+// 也会失败，那样会把故障吞掉。这里先读 PRAGMA table_info 再决定。
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, ddl string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, ddl)
+	return err
 }
 
 // --- 预编译语句缓存 ---
@@ -183,15 +230,54 @@ func queryRow(ctx context.Context, db *sql.DB, q string, args ...any) (*sql.Row,
 	return st.QueryRowContext(ctx, args...), nil
 }
 
+// --- app_settings ---
+
+// GetAppSettings 读取全部运行时设置（webhook 等）。
+//
+// 表很小且只在启动/保存时读取，不做缓存；管理后台改完即可见。
+func GetAppSettings(ctx context.Context, db *sql.DB) (map[string]string, error) {
+	rows, err := query(ctx, db, `SELECT key, value FROM app_settings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
+// SetAppSetting 写入一条设置。value 为空字符串表示删除该覆盖项，
+// 让配置回落到 config.yaml / 环境变量。
+func SetAppSetting(ctx context.Context, db *sql.DB, key, value string, now int64) error {
+	if strings.TrimSpace(value) == "" {
+		_, err := exec(ctx, db, `DELETE FROM app_settings WHERE key = ?`, key)
+		return err
+	}
+	_, err := exec(ctx, db,
+		`INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		key, value, now)
+	return err
+}
+
 // --- deepl_keys CRUD ---
 
-func InsertKey(ctx context.Context, db *sql.DB, name, authKey, endpoint, provider string) (int64, error) {
+func InsertKey(ctx context.Context, db *sql.DB, name, authKey, endpoint, provider, quotaPeriod string) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, OperationTimeout)
 	defer cancel()
 	now := time.Now().UnixMilli()
+	if quotaPeriod == "" {
+		quotaPeriod = "auto"
+	}
 	res, err := exec(ctx, db,
-		"INSERT INTO deepl_keys (name,auth_key,endpoint,provider,status,created_at,updated_at) VALUES (?,?,?,?,'active',?,?)",
-		name, authKey, endpoint, provider, now, now,
+		"INSERT INTO deepl_keys (name,auth_key,endpoint,provider,quota_period,status,created_at,updated_at) VALUES (?,?,?,?,?,'active',?,?)",
+		name, authKey, endpoint, provider, quotaPeriod, now, now,
 	)
 	if err != nil {
 		return 0, err
@@ -199,20 +285,20 @@ func InsertKey(ctx context.Context, db *sql.DB, name, authKey, endpoint, provide
 	return res.LastInsertId()
 }
 
-func UpdateKey(ctx context.Context, db *sql.DB, id int64, name, authKey, endpoint, provider, status *string) error {
+func UpdateKey(ctx context.Context, db *sql.DB, id int64, name, authKey, endpoint, provider, quotaPeriod, status *string) error {
 	ctx, cancel := context.WithTimeout(ctx, OperationTimeout)
 	defer cancel()
 	now := time.Now().UnixMilli()
 	if status != nil && *status == "active" {
 		_, err := exec(ctx, db,
-			"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), status=?, disable_type=NULL, disabled_until=NULL, updated_at=? WHERE id=?",
-			name, authKey, endpoint, provider, *status, now, id,
+			"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), quota_period=COALESCE(?,quota_period), status=?, disable_type=NULL, disabled_until=NULL, updated_at=? WHERE id=?",
+			name, authKey, endpoint, provider, quotaPeriod, *status, now, id,
 		)
 		return err
 	}
 	_, err := exec(ctx, db,
-		"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), status=COALESCE(?,status), updated_at=? WHERE id=?",
-		name, authKey, endpoint, provider, status, now, id,
+		"UPDATE deepl_keys SET name=COALESCE(?,name), auth_key=COALESCE(?,auth_key), endpoint=COALESCE(?,endpoint), provider=COALESCE(?,provider), quota_period=COALESCE(?,quota_period), status=COALESCE(?,status), updated_at=? WHERE id=?",
+		name, authKey, endpoint, provider, quotaPeriod, status, now, id,
 	)
 	return err
 }
@@ -230,15 +316,18 @@ func GetActiveKeys(ctx context.Context, db *sql.DB) ([]models.DeeplKey, error) {
 	return queryKeys(ctx, db, "SELECT * FROM deepl_keys WHERE status='active' ORDER BY id ASC")
 }
 
-// ReactivateExpiredKeys 将已过禁用期的 key 恢复为 active 状态。
-func ReactivateExpiredKeys(ctx context.Context, db *sql.DB, now int64) error {
+// ReactivateExpiredKeys 恢复已到期的临时或配额禁用，并返回恢复数量。
+func ReactivateExpiredKeys(ctx context.Context, db *sql.DB, now int64) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, OperationTimeout)
 	defer cancel()
-	_, err := exec(ctx, db,
-		"UPDATE deepl_keys SET status='active',disable_type=NULL,disabled_until=NULL,updated_at=? WHERE status='disabled' AND disabled_until IS NOT NULL AND disabled_until<=?",
+	result, err := exec(ctx, db,
+		"UPDATE deepl_keys SET status='active',disable_type=NULL,disabled_until=NULL,updated_at=? WHERE status='disabled' AND disable_type IN ('temporary','quota') AND disabled_until<=?",
 		now, now,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func GetAllKeys(ctx context.Context, db *sql.DB) ([]models.DeeplKey, error) {
@@ -252,6 +341,18 @@ func GetAllKeysWithAuth(ctx context.Context, db *sql.DB) ([]models.DeeplKey, err
 	ctx, cancel := context.WithTimeout(ctx, OperationTimeout)
 	defer cancel()
 	return queryKeys(ctx, db, "SELECT * FROM deepl_keys ORDER BY id ASC")
+}
+
+// GetKeyByID 返回单个 key（含 auth_key），供"测试"/"刷新单个 key"使用。
+func GetKeyByID(ctx context.Context, db *sql.DB, id int64) (*models.DeeplKey, error) {
+	keys, err := queryKeys(ctx, db, "SELECT * FROM deepl_keys WHERE id=?", id)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return &keys[0], nil
 }
 
 func queryKeys(ctx context.Context, db *sql.DB, q string, args ...any) ([]models.DeeplKey, error) {
@@ -285,6 +386,7 @@ func queryKeys(ctx context.Context, db *sql.DB, q string, args ...any) ([]models
 			AuthKey:          strVal(m["auth_key"]),
 			Endpoint:         strVal(m["endpoint"]),
 			Provider:         strVal(m["provider"]),
+			QuotaPeriod:      strVal(m["quota_period"]),
 			Status:           strVal(m["status"]),
 			DisableType:      nullableStr(m["disable_type"]),
 			DisabledUntil:    nullableInt64(m["disabled_until"]),
@@ -300,6 +402,9 @@ func queryKeys(ctx context.Context, db *sql.DB, q string, args ...any) ([]models
 		}
 		if k.Provider == "" {
 			k.Provider = "deepl"
+		}
+		if k.QuotaPeriod == "" {
+			k.QuotaPeriod = "auto"
 		}
 		k.DisabledUntilISO = isoOrNil(k.DisabledUntil)
 		k.LastUsedAtISO = isoOrNil(k.LastUsedAt)
@@ -454,13 +559,16 @@ func DisableKeyTemporary(ctx context.Context, db *sql.DB, keyID int64, errorCode
 	return err
 }
 
-func DisableKeyMonthly(ctx context.Context, db *sql.DB, keyID int64, errorCode, errorMessage string, now int64) error {
+// DisableKeyQuota 把配额耗尽的 key 禁用到指定的重置时刻。
+//
+// 重置时刻由 service 按该 key 的配额周期算出（旧免费 key 每月、
+// 新免费 key 每年），数据库层不关心套餐规则，只负责落库。
+func DisableKeyQuota(ctx context.Context, db *sql.DB, keyID int64, until int64, errorCode, errorMessage string, now int64) error {
 	ctx, cancel := context.WithTimeout(ctx, OperationTimeout)
 	defer cancel()
-	beginning := startOfNextMonthBeijing(time.UnixMilli(now)).UnixMilli()
 	_, err := exec(ctx, db,
-		"UPDATE deepl_keys SET status='disabled',disable_type='monthly',disabled_until=?,last_error_code=?,last_error_message=?,updated_at=? WHERE id=?",
-		beginning, truncate(errorCode, 100), truncate(errorMessage, 500), now, keyID,
+		"UPDATE deepl_keys SET status='disabled',disable_type='quota',disabled_until=?,last_error_code=?,last_error_message=?,updated_at=? WHERE id=?",
+		until, truncate(errorCode, 100), truncate(errorMessage, 500), now, keyID,
 	)
 	return err
 }
@@ -486,13 +594,6 @@ func UpdateUsageSnapshot(ctx context.Context, db *sql.DB, keyID int64, charCount
 }
 
 // --- helpers ---
-
-func startOfNextMonthBeijing(now time.Time) time.Time {
-	offset := 8 * time.Hour
-	bjNow := now.Add(offset)
-	utcNext := time.Date(bjNow.Year(), bjNow.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-	return utcNext.Add(-offset)
-}
 
 func truncate(s string, max int) string {
 	return s[:min(len(s), max)]

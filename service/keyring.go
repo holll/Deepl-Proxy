@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +58,9 @@ type Keyring struct {
 	// round-robin counter
 	counter atomic.Int64
 
+	// notifier 由 main 在启动时注入；读多写一次，用 atomic.Pointer 免锁。
+	notifier atomic.Pointer[Notifier]
+
 	// usageSem 限制后台用量查询的并发度（用 channel 当信号量）。
 	usageSem chan struct{}
 	usageMu  sync.Mutex
@@ -82,6 +89,48 @@ func (kr *Keyring) DB() *sql.DB { return kr.readDB }
 
 // WriteDB returns the write connection (for admin write operations).
 func (kr *Keyring) WriteDB() *sql.DB { return kr.writeDB }
+
+// SetNotifier 注入 webhook 通知器。必须在开始处理请求前调用一次。
+func (kr *Keyring) SetNotifier(n *Notifier) { kr.notifier.Store(n) }
+
+// NotifyNoKeys 在没有任何可用 key 时发出告警。
+//
+// reason 会原样出现在通知正文里，调用方应给出用户能看懂的原因
+// （例如"所有 key 均已熔断"或"没有能处理该请求的 key 类别"）。
+// 去重键是全局的：一次故障只推一条，恢复后再次故障会重新推送。
+func (kr *Keyring) NotifyNoKeys(reason string) {
+	n := kr.notifier.Load()
+	if n == nil {
+		return
+	}
+	n.Notify(Notification{
+		Event:     EventNoKeys,
+		Title:     "没有可用 Key",
+		Message:   reason,
+		Level:     "critical",
+		DedupeKey: "no_keys:global",
+		Data: map[string]any{
+			"reason": reason,
+		},
+	})
+}
+
+// notifyKeyEvent 把一次熔断转成 webhook 通知。所有失败都只影响日志。
+func (kr *Keyring) notifyKeyEvent(event string, k models.DeeplKey, level, title, detail string, data map[string]any) {
+	n := kr.notifier.Load()
+	if n == nil {
+		return
+	}
+	msg := fmt.Sprintf("Key「%s」%s", k.Name, detail)
+	n.Notify(Notification{
+		Event:     event,
+		Title:     title,
+		Message:   msg,
+		Level:     level,
+		DedupeKey: fmt.Sprintf("key:%d", k.ID),
+		Data:      data,
+	})
+}
 
 // invalidateKeyCache marks the in-memory key list as stale.
 //
@@ -142,9 +191,29 @@ func (kr *Keyring) GetActiveKeys(ctx context.Context) ([]models.DeeplKey, error)
 	return loaded, nil
 }
 
+// RunKeyRecovery 恢复已到期的 Key，即使没有翻译请求也会运行。
+func (kr *Keyring) RunKeyRecovery(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		recovered, err := database.ReactivateExpiredKeys(ctx, kr.writeDB, time.Now().UnixMilli())
+		if err != nil && ctx.Err() == nil {
+			log.Printf("keyring: background key recovery failed: %v", err)
+		}
+		if recovered > 0 {
+			kr.invalidateKeyCache()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (kr *Keyring) loadFromDB(ctx context.Context, now int64) ([]models.DeeplKey, error) {
-	// 先恢复已过禁用期的 key
-	if err := database.ReactivateExpiredKeys(ctx, kr.writeDB, now); err != nil {
+	// 翻译请求刷新快照时也可立即恢复，不必等下一次后台检查。
+	if _, err := database.ReactivateExpiredKeys(ctx, kr.writeDB, now); err != nil {
 		log.Printf("keyring: reactivate expired keys failed: %v", err)
 	}
 
@@ -164,12 +233,12 @@ func (kr *Keyring) loadFromDB(ctx context.Context, now int64) ([]models.DeeplKey
 
 // --- Key CRUD wrappers (invalidate cache on write) ---
 
-func (kr *Keyring) AddKey(ctx context.Context, name, authKey, endpoint, prov string) (int64, error) {
-	id, err := database.InsertKey(ctx, kr.writeDB, name, authKey, endpoint, prov)
+func (kr *Keyring) AddKey(ctx context.Context, name, authKey, endpoint, prov, quotaPeriod string) (int64, error) {
+	id, err := database.InsertKey(ctx, kr.writeDB, name, authKey, endpoint, prov, quotaPeriod)
 	if err == nil {
 		kr.invalidateKeyCache()
 		kr.sampleUsageAsync(ctx, models.DeeplKey{
-			ID: id, AuthKey: authKey, Endpoint: endpoint, Provider: prov,
+			ID: id, AuthKey: authKey, Endpoint: endpoint, Provider: prov, QuotaPeriod: quotaPeriod,
 		})
 	}
 	return id, err
@@ -254,8 +323,8 @@ func (kr *Keyring) RefreshAllUsage(ctx context.Context) {
 	log.Printf("keyring: refreshed usage for %d key(s)", len(keys))
 }
 
-func (kr *Keyring) UpdateKeyByID(ctx context.Context, id int64, name, authKey, endpoint, prov, status *string) error {
-	err := database.UpdateKey(ctx, kr.writeDB, id, name, authKey, endpoint, prov, status)
+func (kr *Keyring) UpdateKeyByID(ctx context.Context, id int64, name, authKey, endpoint, prov, quotaPeriod, status *string) error {
+	err := database.UpdateKey(ctx, kr.writeDB, id, name, authKey, endpoint, prov, quotaPeriod, status)
 	if err == nil {
 		kr.invalidateKeyCache()
 	}
@@ -351,9 +420,13 @@ func (kr *Keyring) Translate(ctx context.Context, sel Selection, req *provider.T
 		errType := "network_error"
 		statusCode := 0
 		body := ""
+		retryAfter := ""
 		if result != nil {
 			statusCode = result.StatusCode
 			body = string(result.Body)
+			if statusCode == http.StatusTooManyRequests {
+				retryAfter = result.Headers.Get("Retry-After")
+			}
 		}
 
 		// provider 命中非成功状态码（456/429/5xx/401/403）时会同时返回 result 和 error，
@@ -374,7 +447,7 @@ func (kr *Keyring) Translate(ctx context.Context, sel Selection, req *provider.T
 			log.Printf("keyring: key %s network error: %v", k.Name, err)
 		}
 
-		kr.applyDisable(ctx, k, errType, statusCode, body, err)
+		kr.applyDisable(ctx, k, errType, statusCode, body, retryAfter, err)
 		lastFailure = &FailureInfo{
 			KeyName: k.Name,
 			Status:  statusCode,
@@ -398,8 +471,25 @@ type FailureInfo struct {
 	Err     error
 }
 
-func (kr *Keyring) applyDisable(ctx context.Context, k models.DeeplKey, errType string, statusCode int, body string, err error) {
-	now := time.Now().UnixMilli()
+const defaultTemporaryCooldown = 5 * time.Minute
+
+func temporaryCooldown(statusCode int, retryAfter string, now time.Time) time.Duration {
+	if statusCode != http.StatusTooManyRequests {
+		return defaultTemporaryCooldown
+	}
+	value := strings.TrimSpace(retryAfter)
+	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil && seconds <= uint64((1<<63-1)/time.Second) {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		return max(0, retryAt.Sub(now))
+	}
+	return defaultTemporaryCooldown
+}
+
+func (kr *Keyring) applyDisable(ctx context.Context, k models.DeeplKey, errType string, statusCode int, body, retryAfter string, err error) {
+	nowTime := time.Now().Truncate(time.Millisecond)
+	now := nowTime.UnixMilli()
 	code := fmt.Sprintf("%d", statusCode)
 	msg := body
 	if err != nil {
@@ -408,17 +498,132 @@ func (kr *Keyring) applyDisable(ctx context.Context, k models.DeeplKey, errType 
 
 	switch errType {
 	case "monthly":
-		_ = database.DisableKeyMonthly(ctx, kr.writeDB, k.ID, code, msg, now)
+		// 配额用尽：停到本周期结束。周期由 key 的配额类型决定——
+		// 新免费 key 是每年 100 万，旧 key 是每月 50 万，不能混用。
+		period := ResolveQuotaPeriod(k.QuotaPeriod, k.CharacterLimit)
+		until := QuotaResetAt(time.Now(), period)
+		if err := database.DisableKeyQuota(ctx, kr.writeDB, k.ID, until.UnixMilli(), code, msg, now); err != nil {
+			log.Printf("keyring: disable key %d for quota failed: %v", k.ID, err)
+		}
+		kr.notifyKeyEvent(EventQuotaExhausted, k, "error", "Key 配额用尽",
+			fmt.Sprintf("配额已用尽（%s），已停用到 %s。", quotaPeriodLabel(period), until.Format("2006-01-02 15:04")),
+			map[string]any{
+				"key_id":           k.ID,
+				"endpoint":         k.Endpoint,
+				"provider":         k.Provider,
+				"quota_period":     period,
+				"status":           statusCode,
+				"disabled_until":   until.Format(time.RFC3339),
+				"upstream_message": truncateStr(msg, 300),
+				"character_count":  k.CharacterCount,
+				"character_limit":  k.CharacterLimit,
+			})
 	case "temporary":
-		_ = database.DisableKeyTemporary(ctx, kr.writeDB, k.ID, code, msg, 5*60*1000, now)
+		cooldown := temporaryCooldown(statusCode, retryAfter, nowTime)
+		if err := database.DisableKeyTemporary(ctx, kr.writeDB, k.ID, code, msg, cooldown.Milliseconds(), now); err != nil {
+			log.Printf("keyring: temporarily disable key %d failed: %v", k.ID, err)
+			return
+		}
+		if n := kr.notifier.Load(); n != nil && n.NotifyTemporaryEnabled() {
+			kr.notifyKeyEvent(EventKeyTemporary, k, "warning", "Key 临时停用",
+				fmt.Sprintf("上游返回 %d，已临时停用到 %s。", statusCode, nowTime.Add(cooldown).Format(time.RFC3339)),
+				map[string]any{
+					"key_id":           k.ID,
+					"endpoint":         k.Endpoint,
+					"provider":         k.Provider,
+					"status":           statusCode,
+					"upstream_message": truncateStr(msg, 300),
+				})
+		}
 	case "permanent":
 		_ = database.DisableKeyPermanent(ctx, kr.writeDB, k.ID, code, msg, now)
+		kr.notifyKeyEvent(EventKeyDisabled, k, "critical", "Key 已失效",
+			fmt.Sprintf("上游返回 %d，该 key 已永久停用，请更换。", statusCode),
+			map[string]any{
+				"key_id":           k.ID,
+				"endpoint":         k.Endpoint,
+				"provider":         k.Provider,
+				"status":           statusCode,
+				"upstream_message": truncateStr(msg, 300),
+			})
 	default:
 		// network_error（超时等）：不禁用，仅记录错误信息
 		return
 	}
 
 	kr.invalidateKeyCache()
+}
+
+// KeyTestResult 一次性手动测试的结果（只读检查，不改数据库）。
+type KeyTestResult struct {
+	Ok        bool   `json:"ok"`
+	Status    int    `json:"status"`
+	LatencyMS int64  `json:"latency_ms"`
+	Provider  string `json:"provider"`
+	Endpoint  string `json:"endpoint"`
+	SiteType  string `json:"site_type"`
+	ErrorType string `json:"error_type,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
+
+// TestKey 用一条最小请求真实调用上游，验证 key 是否可用。
+//
+// 刻意不写数据库：手动测试是"先看看能不能用"，是否熔断应该由真实
+// 翻译流量决定，否则运维点一次测试就把 key 禁掉会很意外。
+func (kr *Keyring) TestKey(ctx context.Context, id int64) (KeyTestResult, error) {
+	key, err := database.GetKeyByID(ctx, kr.readDB, id)
+	if err != nil {
+		return KeyTestResult{}, err
+	}
+	res := KeyTestResult{Provider: key.Provider, Endpoint: key.Endpoint}
+	if key.Provider == "" || key.Provider == "deepl" {
+		res.SiteType = provider.DetectSiteType(key.Endpoint)
+	} else {
+		res.SiteType = "deeplx"
+	}
+
+	prov := provider.DetectProvider(key.Provider)
+	// deepl 走 form-urlencoded（只读 FormParams），deeplx 读 Text，
+	// 两者都填上，测试接口才对两类 provider 都成立。
+	form := url.Values{}
+	form.Set("text", "ping")
+	form.Set("target_lang", "ZH")
+	start := time.Now()
+	out, err := prov.Translate(ctx, key.Endpoint, key.AuthKey, &provider.TranslateRequest{
+		Text:       []string{"ping"},
+		TargetLang: "ZH",
+		FormParams: form.Encode(),
+	})
+	res.LatencyMS = time.Since(start).Milliseconds()
+	if out != nil {
+		res.Status = out.StatusCode
+	}
+
+	switch {
+	case err == nil && out != nil && out.StatusCode < 500:
+		res.Ok = true
+	case out != nil:
+		res.ErrorType = provider.ClassifyError(out.StatusCode, string(out.Body), res.SiteType)
+		res.Message = truncateStr(string(out.Body), 300)
+	default:
+		res.ErrorType = "network_error"
+		if err != nil {
+			res.Message = err.Error()
+		}
+	}
+	return res, nil
+}
+
+// quotaPeriodLabel 把内部周期标识转成通知里可读的中文。
+func quotaPeriodLabel(period string) string {
+	switch period {
+	case QuotaPeriodYearly:
+		return "每年配额"
+	case QuotaPeriodMonthly:
+		return "每月配额"
+	default:
+		return "配额"
+	}
 }
 
 func (kr *Keyring) shouldSampleUsage() bool {
@@ -463,7 +668,7 @@ func (kr *Keyring) RefreshUsage(ctx context.Context) []UsageRefreshResult {
 			}
 			errType := provider.ClassifyError(info.Status, info.Text, siteType)
 			if errType != "none" {
-				kr.applyDisable(ctx, k, errType, info.Status, info.Text, nil)
+				kr.applyDisable(ctx, k, errType, info.Status, info.Text, info.RetryAfter, nil)
 			}
 		}
 		data := map[string]any{}

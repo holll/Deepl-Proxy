@@ -2,11 +2,15 @@ package models
 
 // DeeplKey 上游 key 记录
 type DeeplKey struct {
-	ID               int64   `json:"id"`
-	Name             string  `json:"name"`
-	AuthKey          string  `json:"-"`
-	Endpoint         string  `json:"endpoint"`
-	Provider         string  `json:"provider"`
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	AuthKey  string `json:"-"`
+	Endpoint string `json:"endpoint"`
+	Provider string `json:"provider"`
+	// QuotaPeriod 配额周期：auto（按 character_limit 推断）/ monthly / yearly。
+	// DeepL 旧免费 key 为每月 50 万字符，新免费 key 为每年 100 万字符，
+	// 两者的"重置时刻"不同，熔断后必须按周期算到期时间。
+	QuotaPeriod      string  `json:"quota_period"`
 	Status           string  `json:"status"`
 	DisableType      *string `json:"disable_type,omitempty"`
 	DisabledUntil    *int64  `json:"disabled_until,omitempty"`

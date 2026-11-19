@@ -1,90 +1,369 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
-  <title>Deepl Proxy - Admin</title>
-  <link rel="icon" type="image/svg+xml" href="/webui/favicon.svg" sizes="any">
-  <link rel="icon" type="image/png" sizes="16x16" href="/webui/favicon_16.png">
-  <link rel="icon" type="image/png" sizes="32x32" href="/webui/favicon_32.png">
-  <link rel="icon" type="image/png" sizes="96x96" href="/webui/favicon_96.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="/webui/apple-touch-icon.png">
+  <meta name="theme-color" content="#070a10" />
+  <meta name="description" content="Deepl Proxy 管理控制台：多 Key 轮询、自动熔断与翻译缓存管理。" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'" />
+  <title>Deepl Proxy · 控制台</title>
+  <link rel="icon" href="/webui/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/webui/style.css" />
 </head>
 <body>
-  <a href="#app" class="skip-link">跳到主内容</a>
+  <a class="skip-link" href="#main">跳到主内容</a>
 
-<div id="login" class="login-overlay" hidden>
-  <form class="login-box" id="loginForm">
-    <h2>管理员验证</h2>
-    <p>输入 <code translate="no">ADMIN_TOKEN</code> 登录</p>
-    <input id="tokenInput" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" name="admin_token" spellcheck="false" aria-label="管理员令牌" autofocus />
-    <div id="loginError" class="msg-error"></div>
-    <div class="login-actions"><button id="loginBtn" type="submit" class="btn-primary">验证并进入</button></div>
-  </form>
-</div>
-
-<main id="app" hidden>
-  <header class="topbar">
-    <div>
-      <h1>Deepl Proxy 管理台</h1>
-      <span class="topbar-hint">多 Key 轮询 · 自动熔断 · SQLite 缓存</span>
-    </div>
-    <div class="topbar-actions">
-      <button id="reloadBtn">刷新</button>
-      <button id="refreshUsageBtn" class="btn-primary">刷新用量</button>
-      <button id="logoutBtn" class="btn-danger">退出</button>
-    </div>
-  </header>
-
-  <div id="statusBar" class="status-bar" role="status" aria-live="polite"></div>
-
-  <section class="card">
-    <h3>新增 Key</h3>
-    <div class="form-grid">
-      <div class="field"><label for="fName">Name</label><input id="fName" placeholder="my-key…" autocomplete="off" spellcheck="false" /></div>
-      <div class="field"><label for="fAuth">Auth Key</label><input id="fAuth" placeholder="DeepL API key（deeplx 可留空）" autocomplete="off" spellcheck="false" /></div>
-      <div class="field"><label for="fEndpoint">Endpoint</label>
-        <select id="fEndpointSelect">
-          <option value="https://api.deepl-pro.com">api.deepl-pro.com（第三方）</option>
-          <option value="https://api-free.deepl.com">api-free.deepl.com（官方免费）</option>
-          <option value="https://api.deepl.com">api.deepl.com（官方付费）</option>
-          <option value="__custom__">自定义…</option>
-        </select>
-        <input id="fEndpoint" placeholder="https://..." autocomplete="off" spellcheck="false" hidden />
+  <!-- 确认对话框：原生 dialog + showModal()，避免 window.confirm 阻塞与不可样式化 -->
+  <dialog id="confirmDialog" class="confirm" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
+    <form method="dialog" class="confirm-inner">
+      <h2 id="confirmTitle">确认操作</h2>
+      <p id="confirmBody"></p>
+      <div class="confirm-actions">
+        <button type="submit" value="cancel" class="btn" id="confirmCancel">取消</button>
+        <button type="submit" value="ok" class="btn btn-danger" id="confirmOk">确认</button>
       </div>
-      <div class="field"><label for="fProvider">Provider</label><select id="fProvider" name="provider"><option value="deepl">deepl</option><option value="deeplx">deeplx</option></select></div>
-      <div class="field field-action"><label>&nbsp;</label><button id="addBtn" class="btn-primary">新增</button></div>
-    </div>
+    </form>
+  </dialog>
+
+  <dialog id="keyDialog" class="confirm key-dialog" aria-labelledby="keyDialogTitle">
+    <form method="dialog" class="confirm-inner">
+      <h2 id="keyDialogTitle">查看 Key</h2>
+      <label for="keyValue" class="visually-hidden">完整 API Key</label>
+      <textarea id="keyValue" class="key-value" rows="3" readonly spellcheck="false" translate="no" hidden></textarea>
+      <p id="keyDialogStatus" class="key-dialog-status" role="status"></p>
+      <div class="confirm-actions">
+        <button type="submit" class="btn" autofocus>关闭</button>
+        <button id="copyKeyBtn" type="button" class="btn btn-primary" command="--copy" commandfor="keyValue" disabled>
+          <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+          <svg class="copied-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
+          复制 Key
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 设置对话框：维护认证、缓存与 Webhook 通知 -->
+  <dialog id="settingsDialog" class="settings" aria-labelledby="settingsTitle">
+    <form id="settingsForm" method="dialog" class="settings-form" novalidate>
+      <header class="settings-head">
+        <div>
+          <h2 id="settingsTitle">设置</h2>
+          <p id="settingsHint" class="settings-hint">配置保存在本机数据库；缓存天数和清理参数重启后生效</p>
+        </div>
+        <button id="settingsClose" class="btn btn-icon" type="button" aria-label="关闭设置">✕</button>
+      </header>
+
+      <div class="settings-body">
+        <fieldset class="settings-group">
+          <legend>认证与会话</legend>
+          <div class="field">
+            <label for="sAdminToken">管理员令牌</label>
+            <input id="sAdminToken" type="password" autocomplete="new-password" spellcheck="false"
+                   placeholder="留空表示不修改" autofocus />
+          </div>
+          <div class="field">
+            <label for="sGatewayToken">网关令牌</label>
+            <input id="sGatewayToken" type="password" autocomplete="new-password" spellcheck="false"
+                   aria-describedby="sGatewayHint" />
+            <p id="sGatewayHint" class="field-hint">客户端调用翻译接口时携带的令牌</p>
+          </div>
+          <div class="field">
+            <label for="sSessionTTL">会话有效期（秒）</label>
+            <input id="sSessionTTL" type="number" min="60" max="2592000" step="60" inputmode="numeric" />
+          </div>
+          <div class="field field-inline">
+            <button id="rotateSecretBtn" class="btn" type="button">轮换会话密钥</button>
+            <span class="field-hint">会让所有已登录会话失效</span>
+          </div>
+        </fieldset>
+
+        <fieldset class="settings-group settings-group-cache">
+          <legend>缓存</legend>
+          <div class="field">
+            <label for="sTTLDays">缓存天数</label>
+            <input id="sTTLDays" type="number" min="0" max="3650" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="sCleanupInterval">清理间隔（秒）</label>
+            <input id="sCleanupInterval" type="number" min="10" max="86400" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="sCleanupBatch">单批清理条数</label>
+            <input id="sCleanupBatch" type="number" min="1" max="10000" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="sCleanupRounds">最大清理轮数</label>
+            <input id="sCleanupRounds" type="number" min="1" max="1000" inputmode="numeric" />
+          </div>
+          <div class="field field-check">
+            <label class="check-label" for="sLegacyOff">
+              <input id="sLegacyOff" type="checkbox" />
+              停用 v1 旧缓存键兼容读取
+            </label>
+            <p class="field-hint">旧键行全部过期后可勾选，省掉一次额外查询</p>
+          </div>
+        </fieldset>
+
+        <fieldset class="settings-group settings-group-webhook">
+          <legend>通知（Webhook）</legend>
+          <div class="field field-check">
+            <label class="check-label" for="wEnabled">
+              <input id="wEnabled" type="checkbox" />
+              启用通知
+            </label>
+          </div>
+          <div class="field">
+            <label for="wFormat">格式</label>
+            <select id="wFormat">
+              <option value="generic">generic（POST JSON）</option>
+              <option value="meow">meow（MeoW 兼容）</option>
+              <option value="text">text（POST 纯文本）</option>
+              <option value="get">get（GET URL 模板）</option>
+            </select>
+          </div>
+          <div class="field" id="wURLField">
+            <label for="wURL">Webhook URL</label>
+            <input id="wURL" type="url" spellcheck="false" placeholder="https://…" />
+          </div>
+          <div class="field" id="wNicknameField">
+            <label for="wNickname">MeoW 昵称</label>
+            <input id="wNickname" type="text" spellcheck="false" aria-describedby="wNicknameHint" />
+            <p id="wNicknameHint" class="field-hint">填写你在 MeoW 中设置的昵称。</p>
+          </div>
+          <div class="field">
+            <label for="wTitlePrefix">标题前缀</label>
+            <input id="wTitlePrefix" type="text" placeholder="DeepL Proxy" />
+          </div>
+          <div class="field">
+            <label for="wTimeout">超时（秒）</label>
+            <input id="wTimeout" type="number" min="1" max="60" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="wMinInterval">同事件最短间隔（秒）</label>
+            <input id="wMinInterval" type="number" min="0" max="86400" inputmode="numeric" />
+          </div>
+          <div class="field field-check">
+            <label class="check-label" for="wNotifyKeyDisabled">
+              <input id="wNotifyKeyDisabled" type="checkbox" />
+              Key 永久失效 / 配额耗尽
+            </label>
+          </div>
+          <div class="field field-check">
+            <label class="check-label" for="wNotifyTemporary">
+              <input id="wNotifyTemporary" type="checkbox" />
+              临时熔断（429 / 5xx）
+            </label>
+          </div>
+          <div class="field field-check">
+            <label class="check-label" for="wNotifyNoKeys">
+              <input id="wNotifyNoKeys" type="checkbox" />
+              没有任何可用 Key
+            </label>
+          </div>
+          <div class="field field-inline">
+            <button id="webhookTestBtn" class="btn" type="button">发送测试通知</button>
+            <span id="webhookTestResult" class="field-hint" role="status" aria-live="polite"></span>
+          </div>
+        </fieldset>
+      </div>
+
+      <p id="settingsError" class="form-error settings-error" role="alert" tabindex="-1"></p>
+      <footer class="settings-actions">
+        <button id="settingsCancel" type="button" class="btn">取消</button>
+        <button id="settingsSave" type="submit" class="btn btn-primary">保存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <section id="login" class="login-screen" role="dialog" aria-modal="true" aria-labelledby="loginTitle" hidden>
+    <form id="loginForm" class="login-card" novalidate>
+      <p class="eyebrow">Admin Console</p>
+      <h1 id="loginTitle">管理员验证</h1>
+      <p class="login-hint">输入管理后台令牌以进入控制台（令牌保存在本机数据库）</p>
+      <div class="field" id="tokenField">
+        <label for="tokenInput">管理员令牌</label>
+        <input id="tokenInput" name="admin_token" type="password" autocomplete="current-password"
+               spellcheck="false" required aria-describedby="loginError" />
+      </div>
+      <p id="loginError" class="form-error" role="alert"></p>
+      <button id="loginBtn" type="submit" class="btn btn-primary btn-block">验证并进入</button>
+    </form>
+
+    <!-- 首次启动：数据库里还没有管理员令牌时改走初始化流程 -->
+    <form id="setupForm" class="login-card" novalidate hidden aria-labelledby="setupTitle">
+      <p class="eyebrow">First Run</p>
+      <h1 class="login-title" id="setupTitle">初始化控制台</h1>
+      <p class="login-hint">令牌会保存到本机数据库，之后可在「设置」中修改</p>
+      <div class="field">
+        <label for="setupAdmin">管理员令牌</label>
+        <input id="setupAdmin" type="password" autocomplete="new-password" spellcheck="false"
+               minlength="8" required aria-describedby="setupError" />
+      </div>
+      <div class="field">
+        <label for="setupGateway">网关令牌（可选）</label>
+        <input id="setupGateway" type="password" autocomplete="new-password" spellcheck="false"
+               placeholder="调用翻译接口时使用" aria-describedby="setupError" />
+      </div>
+      <p id="setupError" class="form-error" role="alert"></p>
+      <button id="setupBtn" type="submit" class="btn btn-primary btn-block">完成初始化</button>
+    </form>
   </section>
 
-  <section class="card">
-    <h3>Key 列表</h3>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>ID</th><th>Name</th><th>Endpoint</th><th>Provider</th><th>Status</th><th>禁用原因</th><th>截至</th><th>用量</th><th>操作</th></tr>
-        </thead>
-        <tbody id="tb"></tbody>
-      </table>
-    </div>
-  </section>
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div class="brand-text">
+          <h1>Deepl Proxy</h1>
+          <p>多 Key 轮询 · 自动熔断 · SQLite 缓存</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button id="reloadBtn" class="btn" type="button">刷新</button>
+        <button id="refreshUsageBtn" class="btn btn-primary" type="button">刷新用量</button>
+        <button id="settingsBtn" class="btn" type="button" aria-haspopup="dialog">设置</button>
+        <button id="logoutBtn" class="btn btn-quiet-danger" type="button">退出</button>
+      </div>
+    </header>
 
-  <section class="card">
-    <h3>缓存管理 <span id="cacheCount" class="sub-text"></span></h3>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Cache Key</th><th>译文预览</th><th>大小</th><th>创建时间</th><th>过期时间</th><th>状态</th><th>操作</th></tr>
-        </thead>
-        <tbody id="cacheTb"></tbody>
-      </table>
+    <div class="live-region">
+      <p id="statusBar" class="status" role="status" aria-live="polite"></p>
+      <p id="alertBar" class="status status-error" role="alert" hidden></p>
     </div>
-    <div class="cache-pager" id="cachePager"></div>
-  </section>
-</main>
 
-<script src="/webui/app.js"></script>
+    <div id="keyTestAnnouncement" class="visually-hidden" role="status" aria-atomic="true"></div>
+    <div id="keyTestToast" class="key-test-toast" popover="manual" role="region" aria-label="Key 测试结果" hidden>
+      <p id="keyTestToastMessage"></p>
+      <button id="keyTestToastClose" class="btn" type="button" aria-label="关闭 Key 测试结果">关闭</button>
+    </div>
+
+    <main id="main" tabindex="-1">
+      <section class="panel" aria-labelledby="addTitle">
+        <div class="panel-head">
+          <h2 id="addTitle" class="panel-title">新增 Key</h2>
+          <p class="panel-hint">Key 后缀决定站点：<code translate="no">:fx</code> 免费，<code translate="no">:dp</code> 第三方，其余官方</p>
+        </div>
+        <form id="addForm" class="add-form" novalidate>
+          <div class="field" id="nameField">
+            <label for="fName">Name</label>
+            <input id="fName" name="name" placeholder="my-key" autocomplete="off" spellcheck="false" required aria-describedby="addError" />
+          </div>
+          <div class="field">
+            <label for="fAuth">Auth Key</label>
+            <input id="fAuth" name="auth_key" placeholder="DeepL key（:fx / :dp 可识别）" autocomplete="off" spellcheck="false" aria-describedby="addError" />
+          </div>
+          <div class="field" id="endpointField">
+            <label for="fEndpointSelect">Endpoint</label>
+            <select id="fEndpointSelect" name="endpoint_select">
+              <option value="auto" selected>自动识别（按 Key 后缀）</option>
+              <option value="https://api.deepl-pro.com">api.deepl-pro.com（第三方）</option>
+              <option value="https://api-free.deepl.com">api-free.deepl.com（官方免费）</option>
+              <option value="https://api.deepl.com">api.deepl.com（官方付费）</option>
+              <option value="__custom__">自定义…</option>
+            </select>
+            <input id="fEndpoint" name="endpoint_custom" class="field-extra" placeholder="https://…"
+                   autocomplete="off" spellcheck="false" hidden aria-label="自定义 Endpoint" />
+          </div>
+          <div class="field">
+            <label for="fProvider">Provider</label>
+            <select id="fProvider" name="provider">
+              <option value="deepl">deepl</option>
+              <option value="deeplx">deeplx</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="fQuota">配额周期</label>
+            <select id="fQuota" name="quota_period">
+              <option value="auto" selected>自动（按用量上限）</option>
+              <option value="yearly">每年（100 万）</option>
+              <option value="monthly">每月（50 万）</option>
+            </select>
+          </div>
+          <div class="field field-submit">
+            <button id="addBtn" class="btn btn-primary" type="submit">新增</button>
+          </div>
+        </form>
+        <p id="addError" class="form-error" role="alert"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="keysTitle">
+        <div class="panel-head">
+          <h2 id="keysTitle" class="panel-title">Key 列表</h2>
+          <p id="keysCount" class="count" aria-live="polite"></p>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <caption class="visually-hidden">DeepL Key 列表：名称与 Endpoint 可直接编辑，可查看、测试、停用或删除</caption>
+            <thead>
+              <tr>
+                <th scope="col">ID</th>
+                <th scope="col">名称</th>
+                <th scope="col">Endpoint</th>
+                <th scope="col">站点</th>
+                <th scope="col">状态</th>
+                <th scope="col">用量</th>
+                <th scope="col">截至</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="tb"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel panel-cache" aria-labelledby="cacheTitle">
+        <details id="cacheDetails" class="cache-details">
+          <summary class="cache-summary">
+            <span class="panel-title" id="cacheTitle">翻译记录</span>
+            <span id="cacheLatest" class="cache-latest">仅用于确认服务在正常运行</span>
+            <span id="cacheCount" class="count"></span>
+          </summary>
+          <p class="panel-hint">只用来确认服务还在正常运行；缓存本身由服务自动清理。</p>
+        <div class="table-wrap">
+          <table class="data-table">
+            <caption class="visually-hidden">最近翻译记录，按时间倒序</caption>
+            <thead>
+              <tr>
+                <th scope="col">时间</th>
+                <th scope="col">译文预览</th>
+                <th scope="col">状态</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="cacheTb"></tbody>
+          </table>
+        </div>
+        <nav id="cachePager" class="pager" aria-label="翻译记录分页">
+          <label class="pager-size" for="pageSize">每页
+            <select id="pageSize" aria-label="每页缓存条数">
+              <option value="20">20</option>
+              <option value="30" selected>30</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <span id="pageInfo" class="pager-info" aria-live="polite"></span>
+          <div class="pager-actions">
+            <button id="cachePrev" class="btn btn-sm" type="button">上一页</button>
+            <button id="cacheNext" class="btn btn-sm" type="button">下一页</button>
+          </div>
+        </nav>
+        </details>
+      </section>
+    </main>
+
+    <footer class="page-foot">
+      <span>LOCAL ADMIN</span>
+      <span aria-hidden="true">/</span>
+      <span>数据仅存于本机 SQLite</span>
+    </footer>
+  </div>
+
+  <noscript>
+    <div class="noscript">此控制台需要启用 JavaScript 才能运行。<br />请在浏览器设置中允许脚本后刷新页面。</div>
+  </noscript>
+
+  <script src="/webui/app.js" defer></script>
 </body>
 </html>

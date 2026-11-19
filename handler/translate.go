@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"deepl-proxy/config"
 	"deepl-proxy/models"
 	"deepl-proxy/provider"
 	"deepl-proxy/service"
@@ -17,8 +16,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// SetupRoutes 注册所有路由
-func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, cfg *config.Config) {
+// SetupRoutes 注册所有路由。
+//
+// cfg 与 st 都指向同一份设置：cfg 用于需要"每请求读取最新值"的中间件与登录接口，
+// st 用于读写设置本身；测试或嵌入场景可以直接传静态 *config.Config 与 nil。
+func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, cfg ConfigSource, st *service.Settings, wm *service.WebhookManager) {
 	// CORS
 	r.Use(CORSMiddleware(cfg))
 
@@ -33,6 +35,7 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 	// 管理后台 API
 	admin := r.Group("/admin")
 	{
+		admin.POST("/setup", handleAdminSetup(st))
 		admin.POST("/login", handleAdminLogin(cfg))
 		admin.POST("/logout", handleAdminLogout(cfg))
 		admin.GET("/session", handleAdminSession(cfg))
@@ -41,13 +44,21 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 		authAdmin.Use(AdminAuthMiddleware(cfg))
 		{
 			authAdmin.GET("/keys", handleAdminKeys(kr))
+			authAdmin.GET("/keys/:id/secret", handleAdminKeySecret(kr))
 			authAdmin.POST("/keys", handleAdminKeyCreate(kr))
 			authAdmin.PUT("/keys/:id", handleAdminKeyUpdate(kr))
 			authAdmin.DELETE("/keys/:id", handleAdminKeyDelete(kr))
+			authAdmin.POST("/keys/:id/test", handleAdminKeyTest(kr))
 			authAdmin.POST("/usage-refresh", handleUsageRefresh(kr))
 			authAdmin.GET("/usage-refresh", handleUsageRefresh(kr))
 			authAdmin.GET("/cache", handleCacheList(kr))
 			authAdmin.DELETE("/cache", handleCacheDelete(kr))
+			authAdmin.GET("/settings", handleAdminSettingsGet(st))
+			authAdmin.PUT("/settings", handleAdminSettingsUpdate(st))
+			authAdmin.POST("/settings/rotate-secret", handleAdminRotateSecret(st))
+			authAdmin.GET("/webhook", handleAdminWebhookGet(wm))
+			authAdmin.PUT("/webhook", handleAdminWebhookUpdate(wm))
+			authAdmin.POST("/webhook/test", handleAdminWebhookTest(wm))
 		}
 	}
 
@@ -60,9 +71,9 @@ func SetupRoutes(r *gin.Engine, kr *service.Keyring, cs *service.CacheService, c
 	translate := r.Group("")
 	translate.Use(GatewayAuthMiddleware(cfg))
 	{
-		translate.POST("/v2/translate", handleTranslateCompat(cfg, kr, cs, flight))
-		translate.POST("/translate", handleTranslateCompat(cfg, kr, cs, flight))
-		translate.GET("/v2/usage", handleUsageCompat(cfg, kr))
+		translate.POST("/v2/translate", handleTranslateCompat(kr, cs, flight))
+		translate.POST("/translate", handleTranslateCompat(kr, cs, flight))
+		translate.GET("/v2/usage", handleUsageCompat(kr))
 	}
 }
 
@@ -77,7 +88,7 @@ type upstreamOutcome struct {
 	err     error
 }
 
-func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.CacheService, flight *service.Flight[upstreamOutcome]) gin.HandlerFunc {
+func handleTranslateCompat(kr *service.Keyring, cs *service.CacheService, flight *service.Flight[upstreamOutcome]) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 解析请求（支持 JSON 和 form-urlencoded）
 		parsed, err := parseTranslateRequest(c)
@@ -97,12 +108,14 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 			return
 		}
 		if len(keys) == 0 {
+			kr.NotifyNoKeys("当前没有任何可用 Key：可能已全部熔断，或尚未添加 Key。")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "No available keys"})
 			return
 		}
 
 		sel, ok := kr.Select(keys, len(parsed.texts), parsed.extraParams)
 		if !ok {
+			kr.NotifyNoKeys("有 Key 处于可用状态，但没有能处理该请求的 Key 类别（DeepLX 仅支持单条文本且不支持 formality/glossary_id 等参数）。")
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"message": "No key can serve this request: deeplx keys accept exactly one text and ignore formality/glossary_id/context/model_type/split_sentences/preserve_formatting/outline_detection",
 			})
@@ -208,6 +221,7 @@ func handleTranslateCompat(cfg *config.Config, kr *service.Keyring, cs *service.
 			msg := "All keys unavailable"
 			if out.failure != nil {
 				msg = "All keys unavailable, last failure: " + out.failure.KeyName
+				kr.NotifyNoKeys("所有 Key 调用均失败，最后一次失败来自「" + out.failure.KeyName + "」：" + out.failure.Body)
 			}
 			if out.err != nil && c.Request.Context().Err() != nil {
 				// 客户端已经走了，没必要再写响应体。
@@ -386,7 +400,7 @@ func buildIdentity(p *translateParams) *models.CacheIdentity {
 
 // --- Usage API ---
 
-func handleUsageCompat(cfg *config.Config, kr *service.Keyring) gin.HandlerFunc {
+func handleUsageCompat(kr *service.Keyring) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		keys, err := kr.GetActiveKeys(c.Request.Context())
 		if err != nil || len(keys) == 0 {

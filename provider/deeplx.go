@@ -93,7 +93,13 @@ func (d *DeepLX) Translate(ctx context.Context, endpoint, authKey string, req *T
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return deepLXErrorResult(resp.StatusCode, body), fmt.Errorf("deeplx upstream status %d", resp.StatusCode)
+		result := deepLXErrorResult(resp.StatusCode, body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+				result.Headers.Set("Retry-After", retryAfter)
+			}
+		}
+		return result, fmt.Errorf("deeplx upstream status %d", resp.StatusCode)
 	}
 
 	// 解析 DeepLX 响应

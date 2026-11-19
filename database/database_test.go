@@ -211,7 +211,7 @@ func TestCleanExpiredCache(t *testing.T) {
 func TestKeyLifecycle(t *testing.T) {
 	writeDB, readDB := newTestDB(t)
 
-	id, err := InsertKey(context.Background(), writeDB, "test", "secret", "https://api.deepl.com", "deepl")
+	id, err := InsertKey(context.Background(), writeDB, "test", "secret", "https://api.deepl.com", "deepl", "auto")
 	if err != nil {
 		t.Fatalf("InsertKey: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestKeyLifecycle(t *testing.T) {
 
 	// 停用后不应出现在可用列表里
 	disabled := "disabled"
-	if err := UpdateKey(context.Background(), writeDB, id, nil, nil, nil, nil, &disabled); err != nil {
+	if err := UpdateKey(context.Background(), writeDB, id, nil, nil, nil, nil, nil, &disabled); err != nil {
 		t.Fatalf("UpdateKey: %v", err)
 	}
 	keys, err = GetActiveKeys(context.Background(), readDB)
